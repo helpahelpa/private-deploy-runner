@@ -727,16 +727,45 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
         with self.lock():
             active=self.active();path,manifest=self.verify(active['release_path'])
             require(active['release']==manifest['commit'] and active['image']==manifest['image'],'Active registry mismatch')
-            self.validate_container(active['container'],path,manifest,running=False)
+            state=self.validate_container(active['container'],path,manifest,running=False)
             running=self.docker('ps','--quiet','--filter','label=com.docker.compose.project='+self.c['project'],
                                 '--filter','label=com.docker.compose.service=world','--no-trunc').decode().split()
             require(all(cid==active['container'] for cid in running),'Another managed world is running')
             self.ensure_ingress()
-            state=self.inspect(active['container'])
-            if not state['State']['Running']:self.docker('start',active['container'],timeout=10)
+            if not state['State']['Running']:
+                self.refresh_desktop_binds(path,manifest,state)
+                self.docker('start',active['container'],timeout=10)
             self.healthy(active['container'],path,manifest,time.monotonic()+self.c.get('health_timeout_seconds',15))
             self.record_active(active['container'],path,manifest)
             return {'release':manifest['commit'],'recovered':True,'container':active['container'],'ingress':self.ingress_id()}
+
+    def refresh_desktop_binds(self,release,manifest,validated):
+        """Re-register vanished Desktop bind mappings for a validated stopped world."""
+        if validated['State']['Running']:return
+        distro=validated['Config'].get('Labels',{}).get('desktop.docker.io/wsl-distro','')
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+',distro):return
+        binds=[(source,target) for kind,source,target,ro in self.mounts(release) if kind=='bind']
+        translated={'/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/'+distro+'/'+hashlib.sha256(source.encode()).hexdigest()
+                    for source,target in binds}
+        if not any(m['Type']=='bind' and m['Source'] in translated for m in validated['Mounts']):return
+        # Only exact paths already matched by validate_container are admitted.
+        # No application data volume or application program enters this helper.
+        require(all(not re.search(r'[,\x00-\x1f\x7f]',value) for pair in binds for value in pair),'Unsafe bind refresh path')
+        name='private-bind-refresh-'+uuid.uuid4().hex
+        args=['run','--rm','--name',name,'--label','private.trusted-project='+self.c['project'],
+              '--label','private.runtime-role=bind-refresh',*sandbox_flags()]
+        for source,target in binds:
+            args+=['--mount','type=bind,src='+source+',dst='+target+',readonly']
+        args+=['--entrypoint','python',manifest['image'],'-I','-c','pass']
+        try:self.docker(*args,timeout=30)
+        finally:
+            # A CLI timeout can precede receipt of a CID. The trusted unique
+            # name also removes that helper without touching any world CID.
+            try:
+                cleanup=subprocess.run(['docker','rm','--force',name],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+            except subprocess.TimeoutExpired:
+                raise DeploymentError('Bind refresh cleanup exceeded its time limit') from None
+            require(cleanup.returncode==0 or b'No such container:' in cleanup.stderr,'Bind refresh cleanup failed')
 
     def status(self):
         with self.lock(wait_seconds=5):

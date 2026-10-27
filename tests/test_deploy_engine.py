@@ -1,5 +1,7 @@
 """Trusted boundary tests. Docker tests create only unique, disposable resources."""
 import importlib.util
+import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -163,6 +165,131 @@ class BoundaryTests(unittest.TestCase):
         source=Path(e.__file__).read_text()
         self.assertNotIn('shutil.copyfile(snapshot',source)
         self.assertNotIn('restore(',source)
+
+
+class DesktopRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        BoundaryTests.setUp(self)
+        self.release=self.root/'release';(self.release/'assets').mkdir(parents=True)
+        for name in ('server.crt','server.key','ca.crt'):(self.root/'certs'/name).write_text('fixture')
+        self.manifest={'commit':'a'*40,'image':'sha256:'+'b'*64}
+        self.cid='c'*64
+        self.registry=dict(release=self.manifest['commit'],image=self.manifest['image'],container=self.cid,release_path=str(self.release))
+        self.state={'Image':self.manifest['image'],'State':{'Running':False},
+                    'Config':{'Labels':{'desktop.docker.io/wsl-distro':'FixtureDistro'},'Env':['TZ=Asia/Tokyo'],
+                              'User':'1000:1000','Cmd':['--deployment-release='+self.manifest['commit'],
+                              '--deployment-control=/control/socket','--deployment-secret=/control/secret']},
+                    'HostConfig':{'Tmpfs':{'/tmp':'','/app/server/logs':''},'ReadonlyRootfs':True,
+                                  'NetworkMode':self.engine.network,'CapDrop':['ALL'],
+                                  'SecurityOpt':['no-new-privileges:true'],'RestartPolicy':{'Name':'no'}},
+                    'NetworkSettings':{'Networks':{self.engine.network:{}}}}
+        self.set_mounts(translated=True)
+        self.commands=[];self.running=b'';self.helper_error=None
+        self.cleanup=self.enterContext(patch.object(e.subprocess,'run',return_value=subprocess.CompletedProcess([],1,b'',b'No such container: fixture')))
+        self.enterContext(patch.object(self.engine,'active',return_value=self.registry))
+        self.enterContext(patch.object(self.engine,'verify',return_value=(self.release,self.manifest)))
+        self.enterContext(patch.object(self.engine,'inspect',side_effect=lambda *args,**kwargs:copy.deepcopy(self.state)))
+        self.enterContext(patch.object(self.engine,'docker',side_effect=self.docker))
+        self.ingress=self.enterContext(patch.object(self.engine,'ensure_ingress'))
+        self.health=self.enterContext(patch.object(self.engine,'healthy'))
+        self.record=self.enterContext(patch.object(self.engine,'record_active'))
+        self.enterContext(patch.object(self.engine,'ingress_id',return_value='d'*64))
+
+    def set_mounts(self,*,translated):
+        self.state['Mounts']=[]
+        for kind,source,target,ro in self.engine.mounts(self.release):
+            value={'Type':kind,'Destination':target,'RW':not ro}
+            if kind=='volume':value['Name']=source
+            else:
+                value['Source']=('/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/FixtureDistro/'+hashlib.sha256(source.encode()).hexdigest()) if translated else source
+            self.state['Mounts'].append(value)
+
+    def docker(self,*args,**kwargs):
+        self.commands.append((args,kwargs))
+        if args[:2]==('network','inspect'):return b'[{"Internal":true}]'
+        if args[0]=='ps':return self.running
+        if args[0]=='run':
+            if self.helper_error:raise self.helper_error
+            return b''
+        if args==('start',self.cid):return self.cid.encode()
+        raise AssertionError('Unexpected Docker operation')
+
+    def test_stopped_validated_desktop_world_refreshes_only_readonly_binds_before_original_start(self):
+        result=self.engine.recover_active()
+        self.assertEqual(self.cid,result['container'])
+        commands=[args for args,kwargs in self.commands]
+        helper=next(args for args in commands if args[0]=='run')
+        self.assertLess(commands.index(helper),commands.index(('start',self.cid)))
+        self.assertEqual(('-I','-c','pass'),helper[-3:])
+        self.assertEqual(('python',self.manifest['image']),helper[-5:-3])
+        for flag in ('--network=none','--read-only','--user=1000:1000','--cap-drop=ALL','--security-opt=no-new-privileges:true'):
+            self.assertIn(flag,helper)
+        mounts=[helper[n+1] for n,value in enumerate(helper) if value=='--mount']
+        expected=['type=bind,src='+source+',dst='+target+',readonly' for kind,source,target,ro in self.engine.mounts(self.release) if kind=='bind']
+        self.assertCountEqual(expected,mounts)
+        self.assertTrue(all('type=volume' not in value for value in mounts))
+        for flag in ('--env','--publish','--privileged'):self.assertNotIn(flag,helper)
+        cleanup=self.cleanup.call_args.args[0]
+        self.assertEqual(['docker','rm','--force',helper[helper.index('--name')+1]],cleanup)
+        self.record.assert_called_once_with(self.cid,self.release,self.manifest)
+
+    def test_unvalidated_foreign_container_never_refreshes_or_starts(self):
+        for mutation in ('image','mount','isolation','distro'):
+            with self.subTest(mutation=mutation):
+                original=copy.deepcopy(self.state);self.commands.clear()
+                if mutation=='image':self.state['Image']='sha256:'+'f'*64
+                elif mutation=='mount':self.state['Mounts'][1]['Source']+='/foreign'
+                elif mutation=='isolation':self.state['HostConfig']['Privileged']=True
+                else:self.state['Config']['Labels']['desktop.docker.io/wsl-distro']='../foreign'
+                with self.assertRaises(e.DeploymentError):self.engine.recover_active()
+                self.assertFalse(any(args[0] in ('run','start') for args,kwargs in self.commands))
+                self.state=original
+        self.cleanup.assert_not_called();self.health.assert_not_called()
+
+    def test_another_managed_world_blocks_bind_refresh_and_start(self):
+        self.running=('e'*64).encode()
+        with self.assertRaises(e.DeploymentError):self.engine.recover_active()
+        self.assertFalse(any(args[0] in ('run','start') for args,kwargs in self.commands))
+        self.cleanup.assert_not_called();self.ingress.assert_not_called()
+
+    def test_running_world_does_not_refresh_or_restart(self):
+        self.state['State']['Running']=True
+        self.engine.recover_active()
+        self.assertFalse(any(args[0] in ('run','start') for args,kwargs in self.commands))
+        self.cleanup.assert_not_called();self.health.assert_called_once()
+
+    def test_native_bind_sources_start_without_desktop_refresh(self):
+        self.set_mounts(translated=False)
+        for labels in ({},{'desktop.docker.io/wsl-distro':'FixtureDistro'}):
+            self.state['Config']['Labels']=labels;self.commands.clear()
+            self.engine.recover_active()
+            self.assertIn(('start',self.cid),[args for args,kwargs in self.commands])
+            self.assertFalse(any(args[0]=='run' for args,kwargs in self.commands))
+        self.cleanup.assert_not_called()
+
+    def test_helper_failure_cleans_exact_disposable_name_and_blocks_world_start(self):
+        self.helper_error=e.DeploymentError('Fixture timeout')
+        with self.assertRaises(e.DeploymentError):self.engine.recover_active()
+        self.cleanup.assert_called_once()
+        self.assertFalse(any(args[0]=='start' for args,kwargs in self.commands))
+        self.health.assert_not_called();self.record.assert_not_called()
+
+    def test_cleanup_failure_or_timeout_blocks_world_start(self):
+        for timeout in (False,True):
+            with self.subTest(timeout=timeout):
+                self.commands.clear()
+                self.cleanup.side_effect=subprocess.TimeoutExpired('docker',10) if timeout else None
+                self.cleanup.return_value=subprocess.CompletedProcess([],1,b'',b'Fixture failure')
+                with self.assertRaises(e.DeploymentError):self.engine.recover_active()
+                self.assertFalse(any(args[0]=='start' for args,kwargs in self.commands))
+        self.health.assert_not_called();self.record.assert_not_called()
+
+    def test_bind_csv_injection_rejected_before_helper(self):
+        unsafe=self.root/'game,readonly=false';unsafe.mkdir();self.engine.c['game_data']=unsafe
+        self.set_mounts(translated=True)
+        with self.assertRaises(e.DeploymentError):self.engine.recover_active()
+        self.assertFalse(any(args[0] in ('run','start') for args,kwargs in self.commands))
+        self.cleanup.assert_not_called()
 
 
 @unittest.skipUnless(os.environ.get('PRIVATE_ENGINE_TEST_IMAGE') and os.environ.get('PRIVATE_ENGINE_TEST_GAME_DATA'),'Set test image and GameData paths to run disposable Docker integration')

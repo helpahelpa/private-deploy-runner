@@ -295,6 +295,14 @@ rechecks release integrity every minute, and yields during deployment. Old relea
 containers have no automatic restart policy. Recovery preserves the current data
 volume and never restores a database snapshot.
 
+Docker Desktop can lose its WSL bind mappings when the Linux environment restarts.
+For a stopped, fully validated active container with exact Desktop-translated
+mounts, recovery first re-registers its configured bind paths using a disposable
+container and the pinned release image. Every helper bind is read-only; the helper
+has no network or application data volume and runs only a fixed isolated Python
+no-op. Bounded cleanup removes that helper before recovery starts the original
+world container. A failed validation or helper operation leaves recovery pending.
+
 On a Windows Docker Desktop host, enable Docker Desktop startup at sign-in and
 register the WSL keepalive logon task described above. This recovers the services
 after Windows sign-in; it does not provide startup before anyone signs in. An
