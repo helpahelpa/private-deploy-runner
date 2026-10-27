@@ -1,0 +1,21 @@
+{
+  "source": {
+    "full_name": "example-owner/example-source",
+    "repository_id": 100001,
+    "owner_id": 100000
+  },
+  "control": {
+    "full_name": "example-owner/example-controller",
+    "repository_id": 100002,
+    "owner_id": 100000
+  },
+  "control_branch": "master",
+  "control_private": true,
+  "state_file": "/state/master-watcher.json",
+  "desired_commit_file": "/state/desired-master",
+  "publish_status": false,
+  "poll_seconds": 10,
+  "dispatch_grace_seconds": 120,
+  "retry_seconds": 30,
+  "max_attempts": 3
+}

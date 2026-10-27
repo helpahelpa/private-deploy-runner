@@ -1,0 +1,7 @@
+{
+  "engine_config": "/config/engine.json",
+  "broker_config": "/config/broker.json",
+  "watcher_config": "/config/watcher.json",
+  "python_dependencies": "/opt/dependencies",
+  "tool_path": "/usr/local/bin:/usr/bin:/bin"
+}

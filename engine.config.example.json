@@ -1,0 +1,23 @@
+{
+  "local_root": "/state/releases",
+  "project": "private-main-world",
+  "data_volume": "private-main-world-data",
+  "game_data": "/config/game-data",
+  "certificates": "/config/tls",
+  "control": "/config/world-control",
+  "asset_origin": "https://game.example.invalid",
+  "https_port": 9443,
+  "game_port": 9444,
+  "handoff_timeout_seconds": 30,
+  "health_timeout_seconds": 15,
+  "backup_limit_bytes": 67108864,
+  "data_compatibility": "private-world-invitations-v2",
+  "timezone": "Asia/Tokyo",
+  "runtime_registry": "/state/active-runtime.json",
+  "bootstrap": {
+    "container": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "image": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "release": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "desired_commit_file": "/state/desired-master"
+}

@@ -1,0 +1,24 @@
+{
+  "source": {
+    "full_name": "example-owner/example-source",
+    "repository_id": 100001,
+    "owner_id": 100000
+  },
+  "control": {
+    "full_name": "example-owner/example-controller",
+    "repository_id": 100002,
+    "owner_id": 100000
+  },
+  "control_private": true,
+  "local_root": "/state/deployment",
+  "source_cache": "/state/source-cache.git",
+  "source_deploy_key": "/config/source-readonly-key",
+  "known_hosts": "/config/known-hosts",
+  "client_config": "/config/client-build.json",
+  "engine_config": "/config/engine.json",
+  "registry_config": "/config/registry.json",
+  "socket_path": "/ipc/broker.sock",
+  "token_file": "/ipc/token",
+  "minimum_version": 63,
+  "publish_apk": true
+}

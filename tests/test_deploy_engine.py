@@ -1,0 +1,258 @@
+"""Trusted boundary tests. Docker tests create only unique, disposable resources."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+import uuid
+
+spec=importlib.util.spec_from_file_location('engine',Path(__file__).resolve().parents[1]/'scripts/deploy_engine.py')
+e=importlib.util.module_from_spec(spec);spec.loader.exec_module(e)
+
+
+class BoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)
+        self.c={'local_root':'state','project':'test-project','data_volume':'test-data','game_data':'game',
+                'certificates':'certs','control':'control','asset_origin':'https://assets.example.invalid',
+                'https_port':23443,'game_port':23444,'handoff_timeout_seconds':30,'health_timeout_seconds':2,
+                'backup_limit_bytes':10000000,'data_compatibility':e.COMPATIBILITY}
+        for name in ('game','certs','control'):(self.root/name).mkdir()
+        self.config=self.root/'config.json';e.write_json(self.config,self.c);self.engine=e.Engine(self.config)
+
+    def test_secret_safe_external_command_failure(self):
+        with self.assertRaises(e.DeploymentError) as caught:
+            e.run(['python3','-c',"import sys;print('sensitive-fixture-secret');sys.exit(7)"])
+        self.assertNotIn('sensitive-fixture-secret',str(caught.exception))
+
+    def test_source_hooks_and_fsmonitor_disabled(self):
+        with patch.object(e,'run',return_value=b'fixture') as command:e.git(self.root,'status','--porcelain')
+        args=command.call_args.args[0]
+        self.assertIn('core.hooksPath=/dev/null',args);self.assertIn('core.fsmonitor=false',args)
+
+    def test_fixed_context_never_uses_source_dockerfile(self):
+        self.assertIn(e.BASE,e.DOCKERFILE)
+        self.assertNotIn('ADD ',e.DOCKERFILE);self.assertNotIn('curl ',e.DOCKERFILE)
+        self.assertIn('COPY --chown=1000:1000 server/',e.DOCKERFILE)
+        flags=e.sandbox_flags()
+        for flag in ('--network=none','--read-only','--user=1000:1000','--cap-drop=ALL','--security-opt=no-new-privileges:true'):
+            self.assertIn(flag,flags)
+
+    def test_symlinks_and_path_traversal_rejected(self):
+        (self.root/'game'/'escape').symlink_to('/etc/passwd')
+        with self.assertRaises(e.DeploymentError):e.tree(self.root/'game')
+        for name in ('../escape','/etc/passwd','a/../../escape','a\\escape'):
+            with self.assertRaises(e.DeploymentError):e.relative(name)
+
+    def test_server_git_fixture_mount_injection_rejected_before_docker(self):
+        source=self.root/'source';(source/'server').mkdir(parents=True)
+        (source/'server/multiplayer_server.py').write_text('# Disposable source data only\n')
+        # Both src and dst can occur twice in Docker's CSV syntax; the last
+        # value wins. A .py suffix does not constrain the injected host source.
+        name='launch-build/x,src=/tmp/disposable-marker.txt,dst=/proof.py'
+        fixture=source/name;fixture.parent.mkdir(parents=True);fixture.write_text('# Fixture data\n')
+        for args in (['init','--quiet'],['add','.'],['-c','user.name=Boundary Test','-c','user.email=boundary@example.invalid','commit','--quiet','-m','Disposable fixture']):
+            e.run(['git','-c','core.hooksPath=/dev/null','-C',str(source),*args])
+        commit=e.git(source,'rev-parse','HEAD');original=e.run;docker=[]
+        def guarded(args,**kwargs):
+            if args[0]=='docker':
+                docker.append(args)
+                raise AssertionError('Unsafe source reached Docker')
+            return original(args,**kwargs)
+        with patch.object(e,'run',side_effect=guarded),self.assertRaises(e.DeploymentError):
+            e.build_server(source,commit,self.root/'unpublished')
+        self.assertEqual([],docker)
+
+    def test_server_source_paths_reject_csv_controls_and_git_quoting_ambiguity(self):
+        for name in ('launch-build/test_fixture.py','launch-build/nested/fixture-1.py','server/test_fixture.json'):
+            self.assertEqual(name,e.source_build_path(name).as_posix())
+        for name in ('launch-build/x,src=/tmp/marker,dst=/proof.py','launch-build/a\n.py',
+                     'launch-build/a\t.py','launch-build/a\r.py','launch-build/a".py',
+                     'launch-build/a\\b.py','launch-build/../escape.py','launch-build//a.py'):
+            with self.subTest(name=name),self.assertRaises(e.DeploymentError):e.source_build_path(name)
+
+    def test_same_world_deployment_lock_exclusive(self):
+        other=e.Engine(self.config)
+        with self.engine.lock():
+            with self.assertRaises(e.DeploymentError):
+                with other.lock():pass
+
+    def test_obsolete_queued_commit_rejected(self):
+        desired=self.root/'desired';desired.write_text('a'*40)
+        self.engine.c['desired_commit_file']=desired
+        with self.assertRaises(e.DeploymentError):self.engine.check_desired('b'*40)
+        self.engine.check_desired('a'*40)
+
+    def test_invitationless_compatibility_config_rejected(self):
+        self.c['data_compatibility']='legacy';e.write_json(self.config,self.c)
+        with self.assertRaises(e.DeploymentError):e.Engine(self.config)
+
+    def test_configured_schema_namespace_is_preserved_and_other_policies_rejected(self):
+        self.c['data_compatibility']='legacy-'+e.COMPATIBILITY;e.write_json(self.config,self.c)
+        runtime=e.Engine(self.config)
+        self.assertEqual('legacy-'+e.COMPATIBILITY,runtime.c['data_compatibility'])
+        for value in ('legacy',None,'anything-invitations-v1',False):
+            self.assertFalse(e.compatible_schema(value))
+
+    def test_authenticated_socket_token_is_not_in_request_or_receipt(self):
+        secret='ephemeral-fixture-token-'+'x'*40;e.write_json(self.root/'unused',{})
+        path=self.root/'control'/'secret';path.write_text(secret);path.chmod(0o600)
+        request={'op':'status'};received=[]
+        server=socket.socket(socket.AF_UNIX);server.bind(str(self.root/'control'/'socket'));server.listen(1)
+        def respond():
+            connection,_=server.accept()
+            with connection:
+                received.append(json.loads(connection.makefile('rb').readline()))
+                connection.sendall(b'{"ok":true,"data":{"release":"fixture"}}\n')
+        thread=threading.Thread(target=respond);thread.start()
+        try:self.assertEqual('fixture',self.engine.control(request)['release'])
+        finally:thread.join(3);server.close()
+        self.assertEqual(secret,received[0]['token']);self.assertEqual({'op':'status'},request)
+        self.assertFalse((self.engine.root/'logs').exists())
+
+    def test_bounded_lock_wait_allows_background_guardian_to_release(self):
+        other=e.Engine(self.config);acquired=threading.Event()
+        def wait():
+            with self.engine.lock(wait_seconds=1):acquired.set()
+        with other.lock():
+            worker=threading.Thread(target=wait);worker.start()
+            self.assertFalse(acquired.wait(.05))
+        worker.join(2)
+        self.assertTrue(acquired.is_set())
+        with other.lock(),self.assertRaises(e.DeploymentError):
+            with self.engine.lock(wait_seconds=.02):pass
+
+    def test_runtime_logs_stay_private_while_explicit_build_output_streams(self):
+        import build_logs,sys
+        from unittest.mock import patch
+        with patch.dict(os.environ,{},clear=False):
+            journal=build_logs.configure(self.root/'public')
+            e.run([sys.executable,'-c',"print('private_runtime_value')"],log=self.root/'runtime.private.log')
+            self.assertNotIn('private_runtime_value',journal.read_text())
+            self.assertIn('private_runtime_value',(self.root/'runtime.private.log').read_text())
+            e.run([sys.executable,'-c',"print('build_test_output ... PASS')"],log=self.root/'build.private.log',public_output=True)
+            self.assertIn('build_test_output',journal.read_text())
+
+    def test_release_tampering_rejected(self):
+        # Deliberately synthetic unit fixture, never a passed build receipt.
+        release=self.root/'release';(release/'assets').mkdir(parents=True)
+        (release/'assets'/'update_config.json').write_text('{}');(release/'server-image.tar').write_text('fixture')
+        info={'commit':'a'*40,'image':'sha256:'+'b'*64,'tests_passed':True,'trusted_invariants_passed':True,
+              'invitation_gate':True,'image_tar_sha256':e.digest(release/'server-image.tar')}
+        e.write_json(release/'server.json',info)
+        m={'format':1,'commit':info['commit'],'image':info['image'],'handoff_compatibility':e.PROTOCOL,
+           'data_compatibility':e.COMPATIBILITY,'invitation_gate':True,'files':e.tree(release)}
+        e.write_json(release/'manifest.json',m);self.engine.verify(release)
+        (release/'assets'/'update_config.json').write_text('{"changed":true}')
+        with self.assertRaises(e.DeploymentError):self.engine.verify(release)
+
+    def test_rollback_never_restores_data_and_rejects_changed_expected(self):
+        # Deployment ordering is tested separately from Docker runtime behavior.
+        new={'commit':'b'*40,'image':'sha256:'+'2'*64};old={'commit':'a'*40,'image':'sha256:'+'1'*64}
+        active={'release':old['commit'],'container':'c'*64,'release_path':str(self.root/'old')}
+        with patch.object(self.engine,'active',return_value=active),patch.object(self.engine,'verify',side_effect=[(self.root/'new',new),(self.root/'old',old)]):
+            with self.assertRaises(e.DeploymentError):self.engine.promote(self.root/'new','d'*40,True)
+        source=Path(e.__file__).read_text()
+        self.assertNotIn('shutil.copyfile(snapshot',source)
+        self.assertNotIn('restore(',source)
+
+
+@unittest.skipUnless(os.environ.get('PRIVATE_ENGINE_TEST_IMAGE') and os.environ.get('PRIVATE_ENGINE_TEST_GAME_DATA'),'Set test image and GameData paths to run disposable Docker integration')
+class DockerIsolationTests(unittest.TestCase):
+    setUp=BoundaryTests.setUp
+    def test_real_world_internal_network_snapshot_and_auth_preservation(self):
+        image=os.environ['PRIVATE_ENGINE_TEST_IMAGE'];self.assertRegex(image,r'^sha256:[0-9a-f]{64}$')
+        tag='private-engine-test-'+uuid.uuid4().hex[:12]
+        self.engine.c.update(project=tag,data_volume=tag+'-data',game_data=Path(os.environ['PRIVATE_ENGINE_TEST_GAME_DATA']).resolve());self.engine.network=tag+'-internal';self.engine.ingress_network=tag+'-ingress';self.engine.ingress_name=tag+'-ingress';self.engine.world_alias=tag+'-active-world'
+        # Choose loopback ports without contacting any production listener.
+        ports=[]
+        for _ in range(2):
+            with socket.socket() as s:s.bind(('127.0.0.1',0));ports.append(s.getsockname()[1])
+        self.engine.c.update(https_port=ports[0],game_port=ports[1])
+        self.engine.docker('volume','create',self.engine.c['data_volume'])
+        cids=[]
+        def cleanup():
+            for cid in cids:
+                try:self.engine.docker('rm','--force',cid)
+                except e.DeploymentError:pass
+            try:self.engine.docker('rm','--force',self.engine.ingress_name)
+            except e.DeploymentError:pass
+            for args in [('network','rm',self.engine.network),('network','rm',self.engine.ingress_network),('volume','rm',self.engine.c['data_volume'])]:
+                try:self.engine.docker(*args)
+                except e.DeploymentError:pass
+        self.addCleanup(cleanup)
+        certs=self.root/'fixtures';e.make_test_certs(certs)
+        for n in ('server.crt','server.key','ca.crt'):shutil.copyfile(certs/n,self.root/'certs'/n)
+        secret=self.root/'control'/'secret';secret.write_text('disposable-integration-secret-'+uuid.uuid4().hex);secret.chmod(0o600)
+        release=self.root/'release';(release/'assets').mkdir(parents=True);(release/'assets'/'update_config.json').write_text('{}')
+        manifest={'commit':'a'*40,'image':image}
+        # Seed an actual old account/token in the disposable named volume.
+        seed="import hashlib;from account_auth import AccountAuth;from shared_world import SharedWorld;w=SharedWorld('/data/world.sqlite3');a=AccountAuth('/data/auth.sqlite3',hasher=lambda p,s:hashlib.sha256(p+s).digest());a.create_invitation('Disposable-Integration-Invitation');a.register('ExistingOwner','password-good!',w,invitation_code='Disposable-Integration-Invitation');a.close();w.close()"
+        self.engine.docker('run','--rm',*e.sandbox_flags(),'--mount','type=volume,src='+self.engine.c['data_volume']+',dst=/data','--mount','type=bind,src='+str(self.engine.c['game_data'])+',dst=/app/work/apk/luapack_extracted/GameData,readonly','--workdir','/app/server','--entrypoint','python',image,'-c',seed)
+        self.engine.ensure_network()
+        cid=self.engine.start(release,manifest);cids.append(cid)
+        try:self.engine.healthy(cid,release,manifest,time.monotonic()+10)
+        except e.DeploymentError:
+            self.engine.validate_container(cid,release,manifest)
+            self.fail((self.engine.root/'last-health-error.json').read_text())
+        with self.assertRaises(e.DeploymentError):
+            bad=dict(manifest,image='sha256:'+'f'*64);self.engine.validate_container(cid,release,bad)
+        gateway=json.loads(self.engine.docker('network','inspect',self.engine.network))[0]['IPAM']['Config'][0]['Gateway']
+        denial="import socket; targets=[('1.1.1.1',443),(%r,2375),(%r,2376)];\nfor target in targets:\n try: s=socket.create_connection(target,timeout=.5)\n except OSError: continue\n else: s.close(); raise AssertionError('Unexpected egress/protected host port access')" % (gateway,gateway)
+        self.engine.docker('exec','--user','1000:1000',cid,'python','-I','-c',denial,timeout=5)
+        timezone=self.engine.docker('exec',cid,'python','-I','-c',"import time;assert time.strftime('%z')=='+0900'")
+        self.engine.volume_preflight(image)
+        self.engine.docker('exec',cid,'python','-I','-c',"import sqlite3;db=sqlite3.connect('/data/auth.sqlite3');assert db.execute('PRAGMA journal_mode=WAL').fetchone()[0]=='wal';db.close()")
+        self.engine.control({'op':'prepare','id':'test-handoff','target_release':'b'*40,'compatibility':e.PROTOCOL,'timeout_seconds':30})
+        self.engine.control({'op':'commit','id':'test-handoff'})
+        self.assertTrue(self.engine.control({'op':'status'})['write_fenced'])
+        self.engine.docker('stop','--time','2',cid)
+        try:snapshot=self.engine.snapshot('disposable-handoff',image,time.monotonic()+15)
+        except e.DeploymentError:
+            newest=max((self.engine.root/'logs').glob('*.log'),key=lambda p:p.stat().st_mtime)
+            self.fail(newest.read_text())
+        db=sqlite3.connect(snapshot/'auth.sqlite3')
+        try:
+            self.assertEqual('wal',db.execute('PRAGMA journal_mode=WAL').fetchone()[0])
+            self.assertEqual(1,db.execute('SELECT count(*) FROM accounts').fetchone()[0])
+            self.assertEqual(1,db.execute('SELECT count(*) FROM sessions').fetchone()[0])
+        finally:db.close()
+        # Sealed SQLite backups can retain a WAL header without any sidecars.
+        # An open host connection here would mask the read-only baseline bug.
+        self.assertEqual(b'\x02\x02',(snapshot/'auth.sqlite3').read_bytes()[18:20])
+        self.assertFalse((snapshot/'auth.sqlite3-shm').exists())
+        self.assertFalse((snapshot/'auth.sqlite3-wal').exists())
+        next_manifest=dict(manifest,commit='b'*40)
+        next_cid=self.engine.start(release,next_manifest,'test-handoff');cids.append(next_cid)
+        self.engine.healthy(next_cid,release,next_manifest,time.monotonic()+10)
+        self.engine.preserve_auth(snapshot,image,time.monotonic()+10)
+        status=self.engine.control({'op':'status'})
+        self.assertEqual('consumed',status['handoff']['phase'])
+        self.assertEqual('b'*40,status['release'])
+        # A newly issued session after the snapshot must survive code rollback.
+        issued="import sqlite3,hashlib;db=sqlite3.connect('/data/auth.sqlite3');db.execute('INSERT INTO sessions VALUES(?,(SELECT account FROM accounts LIMIT 1))',(hashlib.sha256(b'new-earned-fixture-token').digest(),));db.commit();db.close()"
+        self.engine.docker('exec',next_cid,'python','-I','-c',issued)
+        self.engine.docker('stop','--time','2',next_cid)
+        rollback_cid=self.engine.start(release,manifest);cids.append(rollback_cid)
+        self.engine.healthy(rollback_cid,release,manifest,time.monotonic()+10)
+        count=self.engine.docker('exec',rollback_cid,'python','-I','-c',"import sqlite3;db=sqlite3.connect('/data/auth.sqlite3');print(db.execute('SELECT count(*) FROM sessions').fetchone()[0])")
+        self.assertEqual(b'2',count.strip())
+        self.engine.preserve_auth(snapshot,image,time.monotonic()+10)
+        # Reboot recovery restarts only the registered CID and trusted ingress.
+        self.engine.record_active(rollback_cid,release,manifest)
+        self.engine.docker('stop','--time','2',rollback_cid,self.engine.ingress_name)
+        with patch.object(self.engine,'verify',return_value=(release,manifest)):
+            recovered=self.engine.recover_active()
+        self.assertEqual(rollback_cid,recovered['container'])
+        self.assertEqual('a'*40,recovered['release'])
+
+
+if __name__=='__main__':unittest.main()

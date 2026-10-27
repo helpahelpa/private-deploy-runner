@@ -1,0 +1,44 @@
+name: Private deployment
+run-name: ${{ inputs.logs_only && 'logs' || 'deploy' }}-${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Source master commit
+        required: true
+        type: string
+      logs_only:
+        description: Show recorded build/test logs without deploying
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: private-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: ${{ inputs.logs_only && 'Recorded build and test logs' || 'Deploy Main' }}
+    runs-on: [self-hosted, Linux, X64, private-deploy]
+    timeout-minutes: 60
+    steps:
+      - name: Read trusted controller
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          clean: true
+      - name: Verify and deploy current source master
+        if: ${{ !inputs.logs_only }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 scripts/pipeline.py --config /config/pipeline.json
+      - name: Show recorded build and test logs
+        if: ${{ inputs.logs_only }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 scripts/pipeline.py --config /config/pipeline.json --logs-only

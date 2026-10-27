@@ -1,0 +1,12 @@
+{
+  "python_image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "node_image": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "minimum_python_tests": 60,
+  "minimum_node_tests": 20,
+  "fixtures": {
+    "work/apk/luapack_extracted/GameData/PlayerLevelInfo.ini": {
+      "path": "/config/game-data/PlayerLevelInfo.ini",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  }
+}

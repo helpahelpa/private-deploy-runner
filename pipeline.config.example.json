@@ -1,0 +1,6 @@
+{
+  "socket_path": "/ipc/broker.sock",
+  "token_file": "/ipc/token",
+  "poll_seconds": 2,
+  "timeout_seconds": 3500
+}

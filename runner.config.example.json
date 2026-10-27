@@ -1,0 +1,13 @@
+{
+  "repository": {
+    "full_name": "example-owner/example-controller",
+    "repository_id": 100002,
+    "owner_id": 100000
+  },
+  "approved_collaborator_ids": [],
+  "repository_private": true,
+  "image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "local_root": "/private-deploy/runner",
+  "ipc": "/private-deploy/ipc",
+  "runner_config": "/private-deploy/runner-config"
+}
