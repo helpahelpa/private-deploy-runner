@@ -332,6 +332,22 @@ credential/trigger restrictions. They do not contact GitHub or change a running
 deployment. Any package-manager commands used for other controller work must use
 the Socket Firewall wrapper (`sfw` or its approved wrappers).
 
+The 2026-10-28 test-quality audit removed 107 weak or duplicate tests: 50 client,
+26 server, 3 transport, and 28 controller cases. It also removed coupled SQL,
+private-cache, and collaborator-call assertions from 44 otherwise useful server
+tests. The retained deployment suites contain 224 client, 741 server, 60 Python
+transport, 23 Worker, and 239 controller tests. The separate 11-case portable
+release suite is retained. Test baselines reflect this explicit curation;
+zero-skip source QA, complete worker coverage, account/session admission and live
+replacement verification remain required.
+
+Tests should exercise public behavior using independent expected outcomes.
+Source-substring/AST snapshots, private implementation choreography, internal
+mock call counts, and handwritten simulations that mirror the implementation
+are poor substitutes. External transport, clock and randomness fixtures remain
+useful boundaries. Binary format, ABI, refusal, and unchanged-payload checks are
+retained where the generated game artifact itself is the public contract.
+
 ## Runtime and reboot
 
 The runner container uses `runner/Dockerfile`, UID1000, a read-only root, dropped

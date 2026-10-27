@@ -585,25 +585,6 @@ class BoundaryTests(unittest.TestCase):
                 watch.GitHub().request("repos/example/control")
         self.assertEqual(str(error.exception), "GitHub unavailable")
 
-    def test_workflow_has_only_private_manual_fixed_controller_entrypoint(self):
-        workflow = (ROOT / ".github/workflows/deploy.yml").read_text()
-        self.assertIn("workflow_dispatch:", workflow)
-        self.assertNotIn("repository_dispatch:", workflow)
-        self.assertNotIn("pull_request", workflow)
-        self.assertNotIn("push:", workflow)
-        self.assertIn("runs-on: [self-hosted, Linux, X64, private-deploy]", workflow)
-        self.assertIn("cancel-in-progress: false", workflow)
-        self.assertIn("persist-credentials: false", workflow)
-        self.assertRegex(workflow, r"uses: actions/checkout@[0-9a-f]{40}\n")
-        self.assertEqual(workflow.count("uses:"), 1)
-        self.assertIn("contents: read", workflow)
-        self.assertIn("actions: read", workflow)
-        self.assertNotIn("write", workflow)
-        self.assertIn("SOURCE_SHA: ${{ inputs.source_sha }}", workflow)
-        self.assertIn("run: python3 scripts/pipeline.py --config /config/pipeline.json", workflow)
-        self.assertNotIn("run: ${{", workflow)
-        self.assertNotIn("secrets.", workflow)
-        self.assertNotIn("repository:", workflow)
 
 
 if __name__ == "__main__":

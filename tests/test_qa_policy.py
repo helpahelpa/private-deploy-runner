@@ -190,33 +190,7 @@ class PipelineQaPolicyTests(unittest.TestCase):
                     pipeline.request(self.config, TOKEN, "submit", A, request_id=ATTEMPT,
                                      force_full_qa=requested)
 
-    def test_forced_execute_attaches_policy_to_submit_and_never_to_log_or_health_reads(self):
-        def reply(config, token, operation, sha, cursor=None, **options):
-            result = self.status(True)
-            if operation == "logs":
-                result.update(text="", cursor=0, more=False)
-            return result
 
-        with patch.object(pipeline, "request", side_effect=reply) as request, \
-                contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(pipeline.execute(self.config, A, request_id=ATTEMPT,
-                                             force_full_qa=True), 0)
-        self.assertEqual([call.args[2] for call in request.call_args_list],
-                         ["submit", "logs", "status"])
-        self.assertEqual(request.call_args_list[0].kwargs,
-                         {"request_id": ATTEMPT, "force_full_qa": True})
-        for call in request.call_args_list[1:]:
-            self.assertEqual(call.kwargs, {"request_id": ATTEMPT})
-
-    def test_start_attempt_defaults_to_explicit_false_and_saves_progress(self):
-        state = self.root / "progress.json"
-        with patch.dict(os.environ, {}, clear=True), \
-                patch.object(pipeline, "request", return_value=self.status()) as request, \
-                contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(pipeline.start_attempt(self.config, A, ATTEMPT, state), 0)
-        self.assertEqual(request.call_args.kwargs,
-                         {"request_id": ATTEMPT, "force_full_qa": False})
-        self.assertEqual(json.loads(state.read_text())["request_id"], ATTEMPT)
 
     def cli(self, policy, start):
         config = self.root / "runner.json"
@@ -242,18 +216,6 @@ class PipelineQaPolicyTests(unittest.TestCase):
                 self.assertEqual(self.cli(value, start), 1)
                 start.assert_not_called()
 
-    def test_workflow_exposes_boolean_default_false_and_passes_it_only_to_start(self):
-        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/deploy.yml").read_text()
-        field = re.search(r"^      force_full_qa:\n((?:        .+\n)+)", workflow, re.M)
-        self.assertIsNotNone(field)
-        self.assertIn("        type: boolean\n", field.group(1))
-        self.assertIn("        default: false\n", field.group(1))
-        steps = workflow.split("      - name: ")[1:]
-        policy_steps = [step for step in steps if "FORCE_FULL_QA:" in step]
-        self.assertEqual(len(policy_steps), 1)
-        self.assertIn("FORCE_FULL_QA: ${{ inputs.force_full_qa }}", policy_steps[0])
-        self.assertIn("if: ${{ !inputs.logs_only }}", policy_steps[0])
-        self.assertIn("scripts/pipeline.py --config /config/pipeline.json --start", policy_steps[0])
 
 
 if __name__ == "__main__":

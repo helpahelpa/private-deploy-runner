@@ -18,15 +18,6 @@ class CoverageTests(unittest.TestCase):
                      tests=len(selected),passed=True,failures=0,errors=0,skipped=0)
                 for index,selected in enumerate(qa.partition(inventory,2))]
 
-    def test_module_partition_is_complete_disjoint_and_deterministic(self):
-        reports=self.reports();result=qa.aggregate(reports,2,3)
-        self.assertEqual(3,result['tests']);self.assertEqual(0,result['skipped'])
-        self.assertEqual(qa.partition(reports[0]['inventory'],2),qa.partition(list(reversed(reports[0]['inventory'])),2))
-        owners={}
-        for index,report in enumerate(reports):
-            for name in report['selected']:
-                module=name.rsplit('.',2)[0]
-                self.assertIn(owners.setdefault(module,index),(index,))
 
     def test_missing_duplicate_skipped_failed_or_inconsistent_evidence_is_rejected(self):
         mutations=[lambda reports:reports.pop(),lambda reports:reports[0].update(executed=[]),

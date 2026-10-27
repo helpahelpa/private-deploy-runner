@@ -17,27 +17,6 @@ spec.loader.exec_module(build)
 
 
 class ClientBoundaryTests(unittest.TestCase):
-    def test_parallel_qa_has_separate_bounded_containers_and_force_flag_is_declared(self):
-        config = {'image': 'sha256:' + '1' * 64}
-        qa = build.container_command(config, [], ['fixture'], qa=True)
-        compile_command = build.container_command(config, [], ['fixture'])
-        self.assertIn('--memory=2560m', qa);self.assertIn('--cpus=2', qa)
-        self.assertIn('--memory=4g', compile_command);self.assertIn('--cpus=4', compile_command)
-        for scratch in ('--tmpfs=/tmp:', '--tmpfs=/work:', '--tmpfs=/mnt:'):
-            self.assertTrue(any(value.startswith(scratch) for value in qa))
-        commands = build.qa_commands([['python3', '/trusted/regression.py']], 3)
-        self.assertEqual(len(commands), 3)
-        self.assertEqual([command[-3] for command in commands], ['0', '1', '2'])
-        for workers in (True, 0, 4):
-            with self.subTest(workers=workers), self.assertRaises(ValueError):
-                build.qa_commands([['python3', '/trusted/regression.py']], workers)
-        with self.assertRaises(ValueError):build.qa_commands([['unreviewed']], 2)
-        arguments = ['build_client.py', '--config', 'fixture', '--source', 'fixture', '--commit', 'a' * 40,
-                     '--output', 'fixture', '--version', '4.2.0.80']
-        for flag in ([], ['--force-full-qa']):
-            with patch.object(sys, 'argv', arguments + flag), patch.object(build, 'build', return_value={}) as run, patch('builtins.print'):
-                build.main()
-                self.assertIs(run.call_args.args[0].force_full_qa, bool(flag))
 
     def test_broad_qa_identity_covers_source_fixtures_harness_config_and_all_mounted_toolchain_bytes(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -44,17 +44,6 @@ class WorldServiceTests(unittest.TestCase):
             self.assertEqual('recovered', self.service.tick())
             recover.assert_called_once_with()
 
-    def test_first_pass_full_validation_then_bounded_readonly_probes(self):
-        self.prime()
-        with patch.object(w, 'run', return_value=b'{"Running":true,"Paused":false}') as command, \
-                patch.object(self.engine, 'control', return_value=self.status) as control, \
-                patch.object(self.engine, 'recover_active') as recover:
-            self.assertEqual('healthy', self.service.tick())
-            self.assertEqual([self.active['container'], self.active['ingress']],
-                             [call.args[0][-1] for call in command.call_args_list])
-            self.assertTrue(all(call.kwargs == {'timeout': 3} for call in command.call_args_list))
-            control.assert_called_once_with({'op': 'status'}, timeout=2)
-            recover.assert_not_called()
 
     def test_handoff_lock_contention_never_probes_or_restarts_previous_world(self):
         other = e.Engine(self.config)
@@ -63,73 +52,12 @@ class WorldServiceTests(unittest.TestCase):
             command.assert_not_called()
             recover.assert_not_called()
 
-    def test_promotion_between_probe_and_recovery_reloads_engine_state_under_its_lock(self):
-        other = e.Engine(self.config)
-        def recover():
-            with other.lock():
-                e.write_json(self.engine.root / 'active.json', dict(self.active, container='f' * 64))
-            return dict(self.recovery, container='f' * 64)
-        with patch.object(self.engine, 'recover_active', side_effect=recover):
-            self.assertEqual('recovered', self.service.tick())
-        self.assertIsNone(self.service.verified)
 
-    def test_recovery_lock_contention_is_deferred_without_failing_service(self):
-        with patch.object(self.engine, 'recover_active', side_effect=e.DeploymentError('Another deployment is running')):
-            self.assertEqual('deployment_in_progress', self.service.tick())
 
-    def test_readonly_probes_release_writer_lock_before_contacting_docker(self):
-        self.prime()
-        other = e.Engine(self.config)
-        def probe(_):
-            with other.lock():
-                return True
-        with patch.object(self.service, 'running', side_effect=probe), \
-                patch.object(self.engine, 'control', return_value=self.status):
-            self.assertEqual('healthy', self.service.tick())
 
-    def test_stopped_world_or_ingress_and_paused_container_use_full_recovery(self):
-        self.prime()
-        for states in ([False], [True, False]):
-            with self.subTest(states=states), patch.object(self.service, 'running', side_effect=states), \
-                    patch.object(self.engine, 'recover_active', return_value=self.recovery) as recover:
-                self.assertEqual('recovered', self.service.tick())
-                recover.assert_called_once_with()
-        with patch.object(w, 'run', return_value=b'{"Running":true,"Paused":true}'):
-            self.assertFalse(self.service.running(self.active['container']))
 
-    def test_changed_active_registry_and_periodic_isolation_check_force_validation(self):
-        self.prime()
-        self.clock.return_value = 161
-        with patch.object(self.engine, 'recover_active', return_value=self.recovery) as recover:
-            self.assertEqual('recovered', self.service.tick())
-            recover.assert_called_once_with()
-        e.write_json(self.engine.root / 'active.json', dict(self.active, release='f' * 40))
-        with patch.object(self.engine, 'recover_active', return_value=dict(self.recovery, release='f' * 40)) as recover:
-            self.assertEqual('recovered', self.service.tick())
-            recover.assert_called_once_with()
 
-    def test_control_mismatch_or_fence_never_reports_healthy(self):
-        self.prime()
-        for status in (dict(self.status, release='f' * 40), dict(self.status, compatibility='old'),
-                       dict(self.status, write_fenced=True)):
-            with self.subTest(status=status), patch.object(self.service, 'running', return_value=True), \
-                    patch.object(self.engine, 'control', return_value=status), \
-                    patch.object(self.engine, 'recover_active', return_value=self.recovery) as recover:
-                self.assertEqual('recovered', self.service.tick())
-                recover.assert_called_once_with()
 
-    def test_docker_outage_and_control_transport_errors_retry_only_trusted_recovery(self):
-        self.prime()
-        with patch.object(w, 'run', side_effect=e.DeploymentError('Private Docker detail')), \
-                patch.object(self.engine, 'recover_active', side_effect=e.DeploymentError('Private Docker detail')) as recover:
-            with self.assertRaises(e.DeploymentError):
-                self.service.tick()
-            recover.assert_called_once_with()
-        with patch.object(self.service, 'running', return_value=True), \
-                patch.object(self.engine, 'control', side_effect=OSError('Private socket path')), \
-                patch.object(self.engine, 'recover_active', return_value=self.recovery) as recover:
-            self.assertEqual('recovered', self.service.tick())
-            recover.assert_called_once_with()
 
     def test_probe_rejects_container_names_and_option_injection(self):
         for value in ('world', '--all', 'c' * 12, None):

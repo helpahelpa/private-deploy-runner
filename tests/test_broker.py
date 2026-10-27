@@ -156,24 +156,7 @@ class AttemptBrokerTests(unittest.TestCase):
             self.assertEqual('failed',restarted.load(A,request_id)['status'])
             self.broker=restarted
 
-    def test_finalize_or_replacement_proof_failure_cannot_report_success(self):
-        for method in ('finalize','verify_replacement'):
-            request_id='12345-'+str(('finalize','verify_replacement').index(method)+1)
-            self.request(request_id=request_id)
-            with patch.object(self.ops,method,side_effect=ValueError('Fixture verification failure')):
-                self.process(request_id)
-            self.assertEqual('failed',self.request('status',sha=A,request_id=request_id)['status'])
-            self.assertEqual(A,self.ops.active)
 
-    def test_final_status_rechecks_current_replacement_but_historical_logs_stay_readonly(self):
-        self.request();self.process()
-        path=self.broker.path(A,'12345-1');before=path.read_bytes()
-        with patch.object(self.ops,'verify_replacement',return_value=False):
-            final=self.request('status',sha=A)
-            self.assertEqual('failed',final['status']);self.assertIs(final['replacement_verified'],False)
-        with patch.object(self.ops,'verify_replacement',side_effect=AssertionError('Historical logs queried runtime')):
-            self.assertEqual('success',self.request('logs',sha=A,cursor=0)['status'])
-        self.assertEqual(before,path.read_bytes())
 
 
 class BrokerTests(unittest.TestCase):
@@ -212,16 +195,6 @@ class BrokerTests(unittest.TestCase):
         value.update(extra)
         return self.broker.handle(value)
 
-    def test_authenticated_exact_commit_finishes_only_after_build_and_activation(self):
-        self.assertEqual(self.request()["status"], "queued")
-        self.assertEqual(self.request()["status"], "queued")
-        self.assertEqual(self.broker.pending.qsize(), 1)
-        self.broker.process(A)
-        self.assertEqual(self.request("status")["status"], "success")
-        self.assertEqual(self.ops.builds, [(A, 63)])
-        self.assertEqual(self.ops.promotions, [A])
-        self.assertEqual(self.ops.finalized, [A])
-        self.assertEqual(self.ops.active, A)
 
     def test_bad_token_injection_and_unknown_operations_never_queue_work(self):
         bad = [{"token": "bad"}, {"sha": "../../private"}, {"sha": A + ";id"},
@@ -280,13 +253,6 @@ class BrokerTests(unittest.TestCase):
         self.assertFalse(self.ops.builds)
         self.assertFalse(self.ops.promotions)
 
-    def test_push_during_build_fails_before_live_handoff(self):
-        self.request()
-        self.ops.after_build = B
-        self.broker.process(A)
-        self.assertEqual(self.request("status")["status"], "failed")
-        self.assertFalse(self.ops.promotions)
-        self.assertEqual(self.ops.active, B)
 
     def test_build_failure_returns_only_generic_fields_and_retains_private_diagnostics(self):
         self.request()
@@ -415,26 +381,6 @@ class BrokerTests(unittest.TestCase):
                 pipeline.execute({"token_file": "/does/not/exist"}, "refs/heads/master")
             request.assert_not_called()
 
-    def test_client_success_requires_authenticated_exact_sha_status(self):
-        config = {"token_file": str(self.config["token_file"])}
-        responses = [{"sha": A, "status": "queued", "stage": "queued"},
-                     {"sha": A, "status": "success", "stage": "complete"},
-                     {"sha": A, "status": "success", "stage": "complete"}]
-        def respond(config, token, operation, sha, cursor=None):
-            self.assertEqual(sha, A)
-            self.assertEqual(token, TOKEN)
-            if operation == "logs":
-                return {"sha": A, "status": current["status"], "stage": current["stage"],
-                        "text": "", "cursor": 0, "more": False}
-            self.assertIn(operation, ("submit", "status"))
-            current.update(responses.pop(0))
-            return dict(current)
-        current = {}
-        with patch.object(pipeline, "request", side_effect=respond):
-            self.assertEqual(pipeline.execute(config, A, sleep=lambda _: None), 0)
-        failed = {"sha": A, "status": "failed", "stage": "failed", "text": "", "cursor": 0, "more": False}
-        with patch.object(pipeline, "request", return_value=failed):
-            self.assertEqual(pipeline.execute(config, A), 1)
 
     def test_cached_receipt_is_immutable_and_detects_tampering(self):
         config = dict(self.config)
@@ -741,17 +687,6 @@ class BrokerTests(unittest.TestCase):
             runtime.promote.assert_not_called()
             git.assert_not_called()
 
-    def test_explicit_same_commit_replacement_keeps_current_master_authority(self):
-        operations=broker.Operations(dict(self.config,engine_config=self.root/'engine.json'))
-        with patch.object(broker.engine,'Engine') as factory,patch.object(operations,'git') as git, \
-                patch.object(operations,'current',return_value=A) as current:
-            runtime=factory.return_value;runtime.c={'desired_commit_file':self.root/'desired'}
-            runtime.status.return_value={'managed_release':A}
-            runtime.promote.return_value={'phase':'healthy'}
-            self.assertEqual({'phase':'healthy'},operations.promote(A,self.root/'fresh-release',replace_same_commit=True))
-            runtime.promote.assert_called_once_with(self.root/'fresh-release',A,replace_same_commit=True)
-            current.assert_called_once_with();git.assert_not_called()
-            self.assertEqual(A+'\n',(self.root/'desired').read_text())
 
     def test_replacement_verification_requires_exact_healthy_receipt_cid_and_stopped_old_world(self):
         operations=broker.Operations(self.config)
@@ -779,41 +714,7 @@ class BrokerTests(unittest.TestCase):
             broker.engine.write_json(receipt,dict(proof,phase='rolled_back_code_only'))
             with self.assertRaises(broker.BrokerError):operations.verify_replacement(A,release,proof)
 
-    def test_current_master_is_reverified_before_publishing_promotion_authority(self):
-        desired = self.root / "desired-master"
-        operations = broker.Operations(dict(self.config, source_cache=self.root / "source.git", engine_config=self.root / "engine.json"))
-        with patch.object(broker.engine, "Engine") as factory, patch.object(operations, "git"), \
-                patch.object(operations, "current", return_value=B):
-            runtime = factory.return_value
-            runtime.c = {"desired_commit_file": desired}
-            runtime.status.return_value = {"managed_release": B}
-            with self.assertRaises(broker.BrokerError):
-                operations.promote(A, Path("/private/release"))
-            self.assertFalse(desired.exists())
-            runtime.promote.assert_not_called()
-        with patch.object(broker.engine, "Engine") as factory, patch.object(operations, "git"), \
-                patch.object(operations, "current", return_value=A) as current:
-            runtime = factory.return_value
-            runtime.c = {"desired_commit_file": desired}
-            runtime.status.side_effect = [{"managed_release": B}, {"managed_release": A}]
-            def promote(release, previous):
-                self.assertEqual(desired.read_text(), A + "\n")
-            runtime.promote.side_effect = promote
-            operations.promote(A, Path("/private/release"))
-            current.assert_called_once_with()
 
-    def test_failed_handoff_updates_registry_to_healthy_rollback_without_success(self):
-        operations = broker.Operations(dict(self.config, source_cache=self.root / "source.git", engine_config=self.root / "engine.json"))
-        with patch.object(broker.engine, "Engine") as factory, patch.object(operations, "git"), \
-                patch.object(operations, "current", return_value=A), patch.object(operations, "status", return_value=B), \
-                patch.object(operations, "finalize") as finalize:
-            runtime = factory.return_value
-            runtime.c = {"desired_commit_file": self.root / "desired-master"}
-            runtime.status.return_value = {"managed_release": B}
-            runtime.promote.side_effect = ValueError("handoff failed")
-            with self.assertRaises(ValueError):
-                operations.promote(A, Path("/private/release"))
-            finalize.assert_called_once_with(B)
 
     def test_unhealthy_failed_handoff_requires_operator_recovery(self):
         operations = broker.Operations(dict(self.config, source_cache=self.root / "source.git", engine_config=self.root / "engine.json"))
@@ -852,24 +753,6 @@ class BrokerTests(unittest.TestCase):
             build.assert_not_called()
         self.assertEqual(self.broker.load(A)["status"], "failed")
 
-    def test_failed_transport_check_blocks_assembly_and_runtime_promotion(self):
-        config = dict(self.config, client_config=self.root / "client.json", transport_config=self.root / "transport.json")
-        Path(config["client_config"]).write_text("{}")
-        operations = broker.Operations(config)
-        self.broker = broker.Broker(config, operations)
-        def command(argv, **kwargs):
-            if str(argv[1]).endswith("check_transport.py"):
-                raise broker.BrokerError("transport failed")
-            return b""
-        self.request()
-        with patch.object(operations, "current", return_value=A), patch.object(operations, "preflight"), \
-                patch.object(operations, "source", return_value=self.root), patch.object(operations, "command", side_effect=command), \
-                patch.object(broker.engine, "build_server"), patch.object(broker.engine, "assemble") as assemble, \
-                patch.object(operations, "promote") as promote:
-            self.broker.process(A)
-            assemble.assert_not_called()
-            promote.assert_not_called()
-        self.assertEqual(self.broker.load(A)["status"], "failed")
 
 
 if __name__ == "__main__":

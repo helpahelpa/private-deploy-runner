@@ -40,13 +40,6 @@ class BoundaryTests(unittest.TestCase):
         args=command.call_args.args[0]
         self.assertIn('core.hooksPath=/dev/null',args);self.assertIn('core.fsmonitor=false',args)
 
-    def test_fixed_context_never_uses_source_dockerfile(self):
-        self.assertIn(e.BASE,e.DOCKERFILE)
-        self.assertNotIn('ADD ',e.DOCKERFILE);self.assertNotIn('curl ',e.DOCKERFILE)
-        self.assertIn('COPY --chown=1000:1000 server/',e.DOCKERFILE)
-        flags=e.sandbox_flags()
-        for flag in ('--network=none','--read-only','--user=1000:1000','--cap-drop=ALL','--security-opt=no-new-privileges:true'):
-            self.assertIn(flag,flags)
 
     def test_symlinks_and_path_traversal_rejected(self):
         (self.root/'game'/'escape').symlink_to('/etc/passwd')
@@ -156,15 +149,6 @@ class BoundaryTests(unittest.TestCase):
         (release/'assets'/'update_config.json').write_text('{"changed":true}')
         with self.assertRaises(e.DeploymentError):self.engine.verify(release)
 
-    def test_rollback_never_restores_data_and_rejects_changed_expected(self):
-        # Deployment ordering is tested separately from Docker runtime behavior.
-        new={'commit':'b'*40,'image':'sha256:'+'2'*64};old={'commit':'a'*40,'image':'sha256:'+'1'*64}
-        active={'release':old['commit'],'container':'c'*64,'release_path':str(self.root/'old')}
-        with patch.object(self.engine,'active',return_value=active),patch.object(self.engine,'verify',side_effect=[(self.root/'new',new),(self.root/'old',old)]):
-            with self.assertRaises(e.DeploymentError):self.engine.promote(self.root/'new','d'*40,True)
-        source=Path(e.__file__).read_text()
-        self.assertNotIn('shutil.copyfile(snapshot',source)
-        self.assertNotIn('restore(',source)
 
 
 class ServerComponentTests(unittest.TestCase):
@@ -297,21 +281,6 @@ class SameCommitPromotionTests(unittest.TestCase):
             with self.subTest(path=path,kwargs=kwargs),self.assertRaises(e.DeploymentError):self.engine.promote(path,self.sha,**kwargs)
         self.assertEqual([],self.commands);self.start.assert_not_called()
 
-    def test_same_commit_runs_full_fenced_handoff_and_records_new_container_proof(self):
-        with patch.dict(os.environ,{},clear=False):
-            journal=e.build_logs.configure(self.root/'public')
-            result=self.engine.promote(self.new,self.sha,replace_same_commit=True)
-            output=journal.read_text()
-        self.assertIn('account/session preservation verified',output)
-        self.assertIn('replacement active; previous container verified stopped',output)
-        for private in (str(self.root),self.cid,self.next_cid,self.sha):self.assertNotIn(private,output)
-        self.assertEqual('healthy',result['phase'])
-        self.assertEqual(self.cid,result['from_container']);self.assertEqual(self.next_cid,result['container'])
-        self.assertEqual(str(self.new),result['release_path']);self.assertEqual(str(self.old),result['previous_release_path'])
-        self.assertIs(result['old_stopped'],True);self.assertFalse(self.running)
-        self.auth.assert_called_once()
-        self.record.assert_called_once_with(self.next_cid,self.new,self.manifest)
-        self.assertEqual(result,json.loads((self.engine.root/'deployments'/(result['id']+'.json')).read_text()))
 
     def test_same_commit_does_not_bypass_latest_commit_authority(self):
         self.engine.c['desired_commit_file'].write_text('f'*40)

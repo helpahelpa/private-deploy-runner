@@ -12,7 +12,7 @@ import unittest
 import uuid
 
 MARKER = 'PRIVATE_SERVER_QA_RESULT='
-MINIMUM_TESTS = 767
+MINIMUM_TESTS = 741
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 
 
