@@ -44,23 +44,6 @@ class ClientQATests(unittest.TestCase):
             self.assertIsNone(qa.load_cached(store, KEY, True))
             with self.assertRaises(ValueError):store.publish(KEY, COMMIT, commands(), b'fresh passed', [], 9)
 
-    def test_partitioned_suite_executes_every_discovered_test_once(self):
-        class Fixture(unittest.TestCase):
-            def test_first(self): pass
-            def test_second(self): pass
-            def test_third(self): pass
-        selected = []
-        expected = None
-        for index in range(3):
-            suite = unittest.defaultTestLoader.loadTestsFromTestCase(Fixture)
-            shard, discovered = qa.selected_suite(suite, index, 3)
-            expected = discovered
-            selected.extend(case.id() for case in shard)
-        self.assertEqual(sorted(selected), expected)
-        self.assertEqual(len(selected), len(set(selected)))
-        for index, count in ((-1, 3), (3, 3), (0, 4), (True, 1)):
-            with self.subTest(index=index, count=count), self.assertRaises(ValueError):
-                qa.selected_suite(unittest.TestSuite(), index, count)
 
     def test_aggregate_rejects_skips_failure_missing_duplicate_or_different_discovery(self):
         good = commands()

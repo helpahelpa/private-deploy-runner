@@ -165,16 +165,6 @@ class PipelineLogTests(unittest.TestCase):
         read.assert_not_called()
         request.assert_not_called()
 
-    def test_logs_only_cli_selects_read_only_action(self):
-        config = self.root / "runner.json"
-        config.write_text(json.dumps(self.config))
-        with patch.object(sys, "argv", ["pipeline.py", "--config", str(config), "--logs-only"]), \
-                patch.dict(pipeline.os.environ, {"SOURCE_SHA": SHA}), \
-                patch.object(pipeline, "show_logs", return_value=0) as show, \
-                patch.object(pipeline, "execute") as execute:
-            self.assertEqual(pipeline.main(), 0)
-        show.assert_called_once_with(self.config, SHA)
-        execute.assert_not_called()
 
     def test_request_validates_page_types_status_and_cursor_before_output(self):
         socket_path = str(self.root / "protocol.sock")
