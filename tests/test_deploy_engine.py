@@ -167,6 +167,70 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn('restore(',source)
 
 
+class SameCommitPromotionTests(unittest.TestCase):
+    def setUp(self):
+        BoundaryTests.setUp(self)
+        self.old=self.root/'old';self.new=self.root/'new';self.old.mkdir();self.new.mkdir()
+        self.sha='a'*40;self.cid='b'*64;self.next_cid='c'*64
+        self.manifest={'commit':self.sha,'image':'sha256:'+'d'*64}
+        self.running=True;self.ignore_stop=False
+        self.engine.c['desired_commit_file']=self.root/'desired';self.engine.c['desired_commit_file'].write_text(self.sha)
+        self.enterContext(patch.object(self.engine,'verify',side_effect=lambda path:(Path(path),dict(self.manifest))))
+        self.enterContext(patch.object(self.engine,'active',return_value={'release':self.sha,'image':self.manifest['image'],'container':self.cid,'release_path':str(self.old)}))
+        self.enterContext(patch.object(self.engine,'inspect',side_effect=lambda cid,**kwargs:{'State':{'Running':self.running}}))
+        self.commands=[]
+        self.enterContext(patch.object(self.engine,'docker',side_effect=self.docker))
+        self.enterContext(patch.object(self.engine,'healthy'))
+        self.enterContext(patch.object(self.engine,'control',return_value={}))
+        for name in ('ensure_network','ensure_ingress','mounts','volume_preflight'):self.enterContext(patch.object(self.engine,name))
+        self.enterContext(patch.object(self.engine,'snapshot',return_value=self.root/'snapshot'))
+        self.auth=self.enterContext(patch.object(self.engine,'preserve_auth'))
+        self.record=self.enterContext(patch.object(self.engine,'record_active'))
+        self.start=self.enterContext(patch.object(self.engine,'start',side_effect=lambda path,*args:self.next_cid if Path(path)==self.new else 'e'*64))
+
+    def docker(self,*args,**kwargs):
+        self.commands.append(args)
+        if args[:2]==('image','inspect'):return json.dumps([{'Id':self.manifest['image']}]).encode()
+        if args[0]=='stop' and self.cid in args and not self.ignore_stop:self.running=False
+        return b''
+
+    def test_same_commit_requires_explicit_flag_and_distinct_immutable_release(self):
+        for path,kwargs in ((self.new,{}),(self.old,{'replace_same_commit':True}),
+                            (self.new,{'replace_same_commit':True,'rollback':True})):
+            with self.subTest(path=path,kwargs=kwargs),self.assertRaises(e.DeploymentError):self.engine.promote(path,self.sha,**kwargs)
+        self.assertEqual([],self.commands);self.start.assert_not_called()
+
+    def test_same_commit_runs_full_fenced_handoff_and_records_new_container_proof(self):
+        with patch.dict(os.environ,{},clear=False):
+            journal=e.build_logs.configure(self.root/'public')
+            result=self.engine.promote(self.new,self.sha,replace_same_commit=True)
+            output=journal.read_text()
+        self.assertIn('account/session preservation verified',output)
+        self.assertIn('replacement active; previous container verified stopped',output)
+        for private in (str(self.root),self.cid,self.next_cid,self.sha):self.assertNotIn(private,output)
+        self.assertEqual('healthy',result['phase'])
+        self.assertEqual(self.cid,result['from_container']);self.assertEqual(self.next_cid,result['container'])
+        self.assertEqual(str(self.new),result['release_path']);self.assertEqual(str(self.old),result['previous_release_path'])
+        self.assertIs(result['old_stopped'],True);self.assertFalse(self.running)
+        self.auth.assert_called_once()
+        self.record.assert_called_once_with(self.next_cid,self.new,self.manifest)
+        self.assertEqual(result,json.loads((self.engine.root/'deployments'/(result['id']+'.json')).read_text()))
+
+    def test_same_commit_does_not_bypass_latest_commit_authority(self):
+        self.engine.c['desired_commit_file'].write_text('f'*40)
+        with self.assertRaises(e.DeploymentError):self.engine.promote(self.new,self.sha,replace_same_commit=True)
+        self.assertEqual([],self.commands)
+
+    def test_reusing_old_cid_or_leaving_old_running_fails_with_rollback(self):
+        for same_cid in (True,False):
+            with self.subTest(same_cid=same_cid):
+                self.running=True;self.ignore_stop=not same_cid
+                self.next_cid=self.cid if same_cid else 'c'*64
+                with self.assertRaises(e.DeploymentError):self.engine.promote(self.new,self.sha,replace_same_commit=True)
+        receipts=[json.loads(path.read_text()) for path in (self.engine.root/'deployments').glob('*.json')]
+        self.assertEqual(2,len(receipts));self.assertTrue(all(value['phase']!='healthy' for value in receipts))
+
+
 class DesktopRecoveryTests(unittest.TestCase):
     def setUp(self):
         BoundaryTests.setUp(self)

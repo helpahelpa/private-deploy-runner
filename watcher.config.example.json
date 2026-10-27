@@ -13,6 +13,7 @@
   "control_private": true,
   "state_file": "/state/master-watcher.json",
   "desired_commit_file": "/state/desired-master",
+  "attempt_bindings": "/state/deployment/attempts",
   "publish_status": false,
   "poll_seconds": 10,
   "dispatch_grace_seconds": 120,

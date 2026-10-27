@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -24,6 +25,7 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 BRANCH = re.compile(r"[A-Za-z0-9_-]+\Z")
 WORKFLOW = "deploy.yml"
+MAX_OBSERVED_RUNS = 128
 STATUS_DESCRIPTIONS = {
     "queued": "Queued for Main deployment",
     "running": "Main build, tests, and deployment running",
@@ -67,6 +69,7 @@ class Config:
     retry_seconds: int = 30
     max_attempts: int = 3
     desired_commit_file: Path | None = None
+    attempt_bindings: Path | None = None
     publish_status: bool = False
     control_private: bool = True
 
@@ -79,6 +82,8 @@ class Config:
                 state_file=Path(value["state_file"]),
                 desired_commit_file=(Path(value["desired_commit_file"])
                                      if value.get("desired_commit_file") is not None else None),
+                attempt_bindings=(Path(value["attempt_bindings"])
+                                  if value.get("attempt_bindings") is not None else None),
                 **{key: value[key] for key in (
                     "control_branch", "poll_seconds", "dispatch_grace_seconds",
                     "retry_seconds", "max_attempts", "publish_status", "control_private") if key in value},
@@ -86,6 +91,7 @@ class Config:
         except (KeyError, TypeError, ValueError):
             raise WatchError("invalid configuration") from None
         if (not config.state_file.is_absolute()
+                or (config.attempt_bindings is not None and not config.attempt_bindings.is_absolute())
                 or (config.desired_commit_file is not None and (
                     not config.desired_commit_file.is_absolute()
                     or config.desired_commit_file.resolve() == config.state_file.resolve()))
@@ -143,6 +149,31 @@ def read_state(path):
         last_run = value.setdefault("last_deployment_run_id", None)
         if last_run is not None and (type(last_run) is not int or last_run <= 0 or deployed is None):
             raise ValueError()
+        for key in ("last_deployment_run_attempt",):
+            if key in value and (type(value[key]) is not int or not 1 <= value[key] < 10**10):
+                raise ValueError()
+        if "last_observed_run" in value:
+            pair = value["last_observed_run"]
+            if (not isinstance(pair, list) or len(pair) != 2 or any(type(n) is not int or n < 0 for n in pair)):
+                raise ValueError()
+        if "observed_run_attempts" in value:
+            seen = value["observed_run_attempts"]
+            if (not isinstance(seen, dict) or len(seen) > MAX_OBSERVED_RUNS
+                    or any(not isinstance(key, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", key)
+                           or type(attempt) is not int or not 0 < attempt < 10**10
+                           for key, attempt in seen.items())):
+                raise ValueError()
+        if "last_observed_run_time" in value:
+            timestamp = value["last_observed_run_time"]
+            if type(timestamp) not in (int, float) or not math.isfinite(timestamp):
+                raise ValueError()
+        if "latest_run_outcome" in value:
+            outcome = value["latest_run_outcome"]
+            if (not isinstance(outcome, dict) or not SHA.fullmatch(outcome.get("sha", ""))
+                    or type(outcome.get("run_id")) is not int or outcome["run_id"] <= 0
+                    or type(outcome.get("attempt")) is not int or not 1 <= outcome["attempt"] < 10**10
+                    or outcome.get("conclusion") not in ("queued", "running", "success", "failure")):
+                raise ValueError()
         statuses = value.setdefault("commit_statuses", {})
         if not isinstance(statuses, dict) or len(statuses) > 32:
             raise ValueError()
@@ -295,8 +326,10 @@ class Watcher:
         try:
             created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00")).timestamp()
             return (type(run["id"]) is int and run["id"] > 0
+                    and type(run.get("run_attempt", 1)) is int and 0 < run.get("run_attempt", 1) < 10**10
                     and (inflight["run_id"] is None or run["id"] == inflight["run_id"])
-                    and run["display_title"] == "deploy-" + inflight["sha"]
+                    and (run["display_title"] == "deploy-" + inflight["sha"]
+                         or (inflight.get("manual") and run["display_title"] == "deploy-current-master"))
                     and run["event"] == "workflow_dispatch"
                     and run["head_branch"] == self.config.control_branch
                     and run["path"] == ".github/workflows/" + WORKFLOW
@@ -304,6 +337,92 @@ class Watcher:
                     and created >= inflight["since"] - 5)
         except (KeyError, TypeError, ValueError, AttributeError):
             return False
+
+    def binding(self, run_id, attempt):
+        if self.config.attempt_bindings is None:
+            return None
+        if type(run_id) is not int or not 0 < run_id < 10**20 or type(attempt) is not int or not 0 < attempt < 10**10:
+            raise WatchError("invalid deployment attempt binding")
+        identifier = str(run_id) + "-" + str(attempt)
+        path = self.config.attempt_bindings / (identifier + ".json")
+        if not path.exists():
+            return None
+        if path.is_symlink() or path.stat().st_size > 4096:
+            raise WatchError("invalid deployment attempt binding")
+        value = json.loads(path.read_text())
+        if (not isinstance(value, dict) or set(value) != {"sha", "request_id"}
+                or value["request_id"] != identifier or not isinstance(value["sha"], str) or not SHA.fullmatch(value["sha"])):
+            raise WatchError("invalid deployment attempt binding")
+        return value["sha"]
+
+    def observe_workflow_runs(self, latest, now):
+        """Manual dispatches and retries are independent of the push dispatcher."""
+        if self.config.attempt_bindings is None:
+            return
+        base = f"repos/{self.config.control.full_name}/actions"
+        runs = self.github.request(f"{base}/workflows/{WORKFLOW}/runs?branch={self.config.control_branch}"
+                                   "&event=workflow_dispatch&per_page=100")["workflow_runs"]
+        floor = self.state.get("last_observed_run", [self.state["last_deployment_run_id"] or 0,
+                                                     self.state.get("last_deployment_run_attempt", 1)])
+        seen = dict(self.state.get("observed_run_attempts", {}))
+        reference_time = self.state.get("last_observed_run_time")
+        if reference_time is None:
+            # Migrate the old single-run watermark without replaying historical
+            # completed runs. A currently active retry is still discoverable.
+            for run in runs:
+                if run.get("id") == floor[0]:
+                    try:
+                        reference_time = self.run_observation_time(run)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+        matches = []
+        for run in runs:
+            try:
+                identifier, attempt = run["id"], run.get("run_attempt", 1)
+                title = run["display_title"]
+                if (type(identifier) is not int or not 0 < identifier < 10**20 or type(attempt) is not int
+                        or not 0 < attempt < 10**10
+                        or not re.fullmatch(r"deploy-(?:[0-9a-f]{40}|current-master)", title)):
+                    continue
+                sha = self.binding(identifier, attempt) or (title[7:] if title != "deploy-current-master" else latest)
+                probe = {"sha": sha, "since": datetime.fromisoformat(run["created_at"].replace("Z", "+00:00")).timestamp(),
+                         "run_id": identifier, "run_attempt": attempt, "manual": True}
+                if self.valid_run(run, probe):
+                    observed_at = self.run_observation_time(run)
+                    previous = seen.get(str(identifier))
+                    fresh = (attempt > previous if previous is not None else
+                             [identifier, attempt] > floor
+                             or (attempt > 1 and run['status'] != 'completed')
+                             or (attempt > 1 and reference_time is not None and observed_at > reference_time))
+                    seen[str(identifier)] = max(attempt, previous or 0)
+                    if fresh:
+                        matches.append((observed_at, identifier, attempt, probe))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        if matches:
+            # Run IDs order creation, not retries. GitHub's execution/update
+            # timestamps let an older run's new attempt supersede old green.
+            observed_at, identifier, attempt, inflight = max(matches, key=lambda item: item[:3])
+            self.state["inflight"] = inflight
+            self.state["last_observed_run"] = [identifier, attempt]
+            self.state["last_observed_run_time"] = observed_at
+            self.state["latest_run_outcome"] = {"sha": inflight["sha"], "run_id": identifier,
+                                                "attempt": attempt, "conclusion": "queued"}
+        bounded = {key: seen[key] for key in sorted(seen, key=int)[-MAX_OBSERVED_RUNS:]}
+        if matches or bounded != self.state.get("observed_run_attempts"):
+            self.state["observed_run_attempts"] = bounded
+            self.save()
+
+    @staticmethod
+    def run_observation_time(run):
+        return max(datetime.fromisoformat(run[key].replace("Z", "+00:00")).timestamp()
+                   for key in ("created_at", "run_started_at", "updated_at") if run.get(key) is not None)
+
+    def record_run_outcome(self, sha, run, conclusion):
+        if self.config.attempt_bindings is not None:
+            self.state["latest_run_outcome"] = {"sha": sha, "run_id": run["id"],
+                                                "attempt": run.get("run_attempt", 1), "conclusion": conclusion}
+            self.save()
 
     def status(self, sha, phase, run_id=None):
         if not self.config.publish_status:
@@ -364,6 +483,7 @@ class Watcher:
         if self.config.desired_commit_file is not None:
             save_desired(self.config.desired_commit_file, latest)
         now = self.clock()
+        self.observe_workflow_runs(latest, now)
         inflight = self.state["inflight"]
         if self.config.publish_status:
             for sha, status in list(self.state["commit_statuses"].items()):
@@ -376,20 +496,36 @@ class Watcher:
         if inflight is not None:
             run = self.find_run(inflight)
             if run is not None:
+                if self.config.attempt_bindings is not None:
+                    attempt = run.get("run_attempt", 1)
+                    resolved = self.binding(run["id"], attempt)
+                    if resolved is not None and resolved != inflight["sha"]:
+                        self.status(inflight["sha"], "superseded", run["id"])
+                        inflight["sha"] = resolved
+                    inflight["run_attempt"] = attempt
+                    self.state["last_observed_run"] = [run["id"], attempt]
+                    self.save()
                 if inflight["run_id"] != run["id"]:
                     inflight["run_id"] = run["id"]
                     self.save()
                 if run["status"] != "completed":
+                    self.record_run_outcome(inflight["sha"], run, "running" if run["status"] == "in_progress" else "queued")
                     self.status(inflight["sha"], "running" if run["status"] == "in_progress" else "queued", run["id"])
                     return "deployment_running"
-                if run["conclusion"] == "success":
+                verified_attempt = (self.config.attempt_bindings is None
+                                    or self.binding(run["id"], run.get("run_attempt", 1)) == inflight["sha"])
+                if run["conclusion"] == "success" and verified_attempt:
                     self.state["deployed_sha"] = inflight["sha"]
                     self.state["last_deployment_run_id"] = run["id"]
+                    if self.config.attempt_bindings is not None:
+                        self.state["last_deployment_run_attempt"] = run.get("run_attempt", 1)
                     self.state["failures"].pop(inflight["sha"], None)
                     self.state["inflight"] = None
                     self.save()
+                    self.record_run_outcome(inflight["sha"], run, "success")
                     self.status(inflight["sha"], "success", run["id"])
                 else:
+                    self.record_run_outcome(inflight["sha"], run, "failure")
                     self.failed(inflight["sha"], now, run["id"])
             elif now - inflight["since"] < self.config.dispatch_grace_seconds:
                 self.status(inflight["sha"], "queued")
@@ -398,6 +534,9 @@ class Watcher:
                 self.failed(inflight["sha"], now)
 
         if latest == self.state["deployed_sha"]:
+            outcome = self.state.get("latest_run_outcome")
+            if outcome and outcome["sha"] == latest and outcome["conclusion"] == "failure":
+                return "latest_deployment_failed"
             if self.state["last_deployment_run_id"] is not None:
                 self.status(latest, "success", self.state["last_deployment_run_id"])
             return "current"

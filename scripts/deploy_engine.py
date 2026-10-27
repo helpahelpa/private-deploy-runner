@@ -668,10 +668,13 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             self.record_active(cid,path,manifest)
             return {'release':manifest['commit'],'adopted':True,'bootstrap':bootstrap,'container':cid}
 
-    def promote(self,release,expected_current,rollback=False):
+    def promote(self,release,expected_current,rollback=False,*,replace_same_commit=False):
         with self.lock(wait_seconds=20):
             path,new=self.verify(release);active=self.active();old_path,old=self.verify(active['release_path'])
-            require(SHA.fullmatch(expected_current or '') and active['release']==expected_current and new['commit']!=expected_current,'Stale or redundant promotion')
+            require(type(replace_same_commit) is bool and SHA.fullmatch(expected_current or '') and active['release']==expected_current,
+                    'Stale promotion')
+            require(new['commit']!=expected_current or (replace_same_commit and not rollback and path!=old_path),
+                    'Redundant promotion requires an explicit distinct release')
             if not rollback:
                 self.check_desired(new['commit'])
                 if self.c.get('repository'):git(self.c['repository'],'merge-base','--is-ancestor',old['commit'],new['commit'])
@@ -681,8 +684,11 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             require(json.loads(self.docker('image','inspect',new['image']))[0]['Id']==new['image'],'Loaded image identity mismatch')
             self.ensure_network();self.ensure_ingress();self.mounts(path);self.volume_preflight(new['image'])
             if not rollback:self.check_desired(new['commit'])
+            build_logs.emit('Deployment: target release and current world validated.')
             deployment=uuid.uuid4().hex;receipt=self.root/'deployments'/(deployment+'.json')
-            event={'id':deployment,'from':old['commit'],'to':new['commit'],'phase':'preparing','rollback':rollback}
+            event={'id':deployment,'from':old['commit'],'to':new['commit'],'phase':'preparing','rollback':rollback,
+                   'from_container':active['container'],'previous_release_path':str(old_path),'release_path':str(path),
+                   'replace_same_commit':replace_same_commit}
             write_json(receipt,event)
             started=time.monotonic();deadline=started+self.c.get('handoff_timeout_seconds',30)
             attempted=False;fenced=False;stopped=False;new_cid=None
@@ -690,19 +696,30 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                 require(time.monotonic()<deadline,'Handoff budget exhausted');return max(.05,min(3,deadline-time.monotonic()))
             try:
                 attempted=True
+                build_logs.emit('Deployment: preparing planned handoff.')
                 self.control({'op':'prepare','id':deployment,'target_release':new['commit'],'compatibility':PROTOCOL,'timeout_seconds':self.c.get('handoff_timeout_seconds',30)},budget())
                 self.control({'op':'commit','id':deployment},budget());fenced=True
+                build_logs.emit('Deployment: previous world fenced against writes.')
                 self.docker('stop','--time','2',active['container'],timeout=min(3,max(.1,deadline-time.monotonic())));stopped=True
+                build_logs.emit('Deployment: previous world stopped.')
                 snapshot=self.snapshot(deployment,new['image'],deadline)
+                build_logs.emit('Deployment: consistent snapshot verified; automatic data restore disabled.')
                 require(time.monotonic()<deadline-2,'Handoff budget exhausted before activation')
+                build_logs.emit('Deployment: starting replacement container.')
                 new_cid=self.start(path,new,deployment,deadline)
+                require(new_cid!=active['container'],'Replacement must use a new container')
                 self.healthy(new_cid,path,new,min(deadline,time.monotonic()+self.c.get('health_timeout_seconds',15)))
                 self.preserve_auth(snapshot,new['image'],deadline)
+                build_logs.emit('Deployment: replacement health and account/session preservation verified.')
+                require(not self.inspect(active['container'],timeout=budget())['State']['Running'],'Previous world is still running')
                 require(time.monotonic()<deadline,'Handoff budget exhausted after auth verification')
                 self.record_active(new_cid,path,new)
-                event.update(phase='healthy',interruption_seconds=round(time.monotonic()-started,3),container=new_cid)
-                write_json(receipt,event);return event
+                event.update(phase='healthy',interruption_seconds=round(time.monotonic()-started,3),container=new_cid,old_stopped=True)
+                write_json(receipt,event)
+                build_logs.emit('Deployment: replacement active; previous container verified stopped.')
+                return event
             except Exception:
+                build_logs.emit('Deployment: handoff failed; checking runtime recovery.')
                 if attempted and not fenced:
                     try:
                         state=self.control({'op':'status'});marker=state.get('handoff',{})
@@ -714,6 +731,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                 if fenced:
                     try:
                         # Never resume a consumed permit and never restore a DB.
+                        build_logs.emit('Deployment: rolling back code while preserving current player data.')
                         if new_cid:self.docker('stop','--time','2',new_cid,timeout=4)
                         self.docker('stop','--time','2',active['container'],timeout=4)
                         rollback_cid=self.start(old_path,old)
@@ -721,6 +739,10 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                         self.record_active(rollback_cid,old_path,old);event['phase']='rolled_back_code_only'
                     except Exception:event['phase']='recovery_required'
                 write_json(receipt,event)
+                build_logs.emit({'cancelled':'Deployment: handoff cancelled; deployment remains failed.',
+                                 'rolled_back_code_only':'Deployment: previous code recovered; deployment remains failed.',
+                                 'recovery_required':'Deployment: operator recovery required; deployment remains failed.'}.get(
+                                     event['phase'],'Deployment: runtime recovery incomplete; deployment remains failed.'))
                 raise DeploymentError('Deployment failed; outcome: '+event['phase']) from None
 
     def recover_active(self):

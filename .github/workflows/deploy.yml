@@ -1,13 +1,13 @@
 # Manual dispatch only; external pull requests do not run on this runner.
 name: Main deployment
-run-name: ${{ inputs.logs_only && 'logs' || 'deploy' }}-${{ inputs.source_sha }}
+run-name: ${{ inputs.logs_only && 'logs' || 'deploy' }}-${{ inputs.source_sha || 'current-master' }}
 
 on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Source master commit
-        required: true
+        description: Source master commit (leave blank to deploy current master)
+        required: false
         type: string
       logs_only:
         description: Show recorded build/test logs without deploying
@@ -33,11 +33,21 @@ jobs:
         with:
           persist-credentials: false
           clean: true
-      - name: Verify and deploy current source master
+      - name: Queue fresh deployment of source master
+        id: prepare
         if: ${{ !inputs.logs_only }}
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
-        run: python3 scripts/pipeline.py --config /config/pipeline.json
+        run: python3 scripts/pipeline.py --config /config/pipeline.json --start
+      - name: Build and test server, client and transport
+        if: ${{ !inputs.logs_only }}
+        run: python3 scripts/pipeline.py --config /config/pipeline.json --wait-through build
+      - name: Replace the active server
+        if: ${{ !inputs.logs_only }}
+        run: python3 scripts/pipeline.py --config /config/pipeline.json --wait-through deploy
+      - name: Verify healthy replacement and stopped previous server
+        if: ${{ !inputs.logs_only }}
+        run: python3 scripts/pipeline.py --config /config/pipeline.json --wait-through verify
       - name: Show recorded build and test logs
         if: ${{ inputs.logs_only }}
         env:

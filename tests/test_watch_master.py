@@ -70,6 +70,166 @@ class FakeGitHub:
 
 
 class WatcherTests(unittest.TestCase):
+    def enable_manual_attempts(self):
+        self.bindings = self.path.parent / 'attempts'
+        self.bindings.mkdir(parents=True)
+        self.config = replace(self.config, attempt_bindings=self.bindings, publish_status=True)
+        self.watcher = self.restart()
+        self.watcher.state.update(deployed_sha=A, last_deployment_run_id=100)
+        self.watcher.save()
+
+    def bind_attempt(self, run_id=101, attempt=1, sha=A):
+        identifier = str(run_id) + '-' + str(attempt)
+        watch.save_state(self.bindings / (identifier + '.json'), {'sha':sha, 'request_id':identifier})
+
+    def test_manual_current_master_run_overrides_old_green_and_failure_stays_red(self):
+        self.enable_manual_attempts()
+        run = self.github.run(run_id=101)
+        run['display_title'] = 'deploy-current-master'
+        self.bind_attempt()
+        self.assertEqual(self.watcher.tick(), 'deployment_running')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'pending')
+        run.update(status='completed', conclusion='failure')
+        self.assertEqual(self.watcher.tick(), 'latest_deployment_failed')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'failure')
+        self.assertEqual(self.restart().tick(), 'latest_deployment_failed')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'failure')
+        self.assertFalse(self.github.dispatches)
+
+    def test_same_github_run_retry_attempt_replaces_previous_green_until_verified(self):
+        self.enable_manual_attempts()
+        run = self.github.run(run_id=101, status='completed', conclusion='success')
+        self.bind_attempt()
+        self.assertEqual(self.watcher.tick(), 'current')
+        run.update(run_attempt=2, status='in_progress', conclusion=None)
+        self.bind_attempt(attempt=2)
+        self.assertEqual(self.restart().tick(), 'deployment_running')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'pending')
+        run.update(status='completed', conclusion='failure')
+        self.assertEqual(self.restart().tick(), 'latest_deployment_failed')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'failure')
+        run.update(run_attempt=3, status='in_progress', conclusion=None)
+        self.bind_attempt(attempt=3)
+        self.assertEqual(self.restart().tick(), 'deployment_running')
+        run.update(status='completed', conclusion='success')
+        self.assertEqual(self.restart().tick(), 'current')
+        self.assertEqual(watch.read_state(self.path)['last_deployment_run_attempt'], 3)
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'success')
+
+    def test_older_run_retry_after_newer_success_tracks_pending_failure_and_later_success(self):
+        self.enable_manual_attempts()
+        old = self.github.run(run_id=101, status='completed', conclusion='success')
+        self.bind_attempt(101)
+        self.assertEqual(self.watcher.tick(), 'current')
+        newer = self.github.run(run_id=102, status='completed', conclusion='success',
+                                created_at='2025-01-01T00:01:00Z')
+        newer['updated_at'] = '2025-01-01T00:01:30Z'
+        self.bind_attempt(102)
+        self.assertEqual(self.watcher.tick(), 'current')
+        old.update(run_attempt=2, status='in_progress', conclusion=None,
+                   run_started_at='2025-01-01T00:02:00Z', updated_at='2025-01-01T00:02:00Z')
+        self.bind_attempt(101, 2)
+        self.assertEqual(self.restart().tick(), 'deployment_running')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'pending')
+        old.update(status='completed', conclusion='failure', updated_at='2025-01-01T00:02:30Z')
+        self.assertEqual(self.restart().tick(), 'latest_deployment_failed')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'failure')
+        self.assertEqual(self.restart().tick(), 'latest_deployment_failed')
+        old.update(run_attempt=3, status='in_progress', conclusion=None,
+                   run_started_at='2025-01-01T00:03:00Z', updated_at='2025-01-01T00:03:00Z')
+        self.bind_attempt(101, 3)
+        self.assertEqual(self.restart().tick(), 'deployment_running')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'pending')
+        old.update(status='completed', conclusion='success')
+        self.assertEqual(self.restart().tick(), 'current')
+        state = watch.read_state(self.path)
+        self.assertEqual((state['last_deployment_run_id'], state['last_deployment_run_attempt']), (101, 3))
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'success')
+        self.assertFalse(self.github.dispatches)
+
+    def test_attempt_watermark_migration_ignores_completed_history_but_discovers_new_retry(self):
+        self.enable_manual_attempts()
+        self.watcher.state.update(last_deployment_run_id=102, last_deployment_run_attempt=1)
+        self.watcher.save()
+        old = self.github.run(run_id=101, status='completed', conclusion='failure')
+        old.update(run_attempt=2, updated_at='2025-01-01T00:01:00Z')
+        self.github.run(run_id=102, status='completed', conclusion='success',
+                        created_at='2025-01-01T00:02:00Z')
+        self.assertEqual(self.watcher.tick(), 'current')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'success')
+        self.assertIsNone(self.watcher.state['inflight'])
+        old.update(run_attempt=3, status='in_progress', conclusion=None,
+                   updated_at='2025-01-01T00:03:00Z')
+        self.bind_attempt(101, 3)
+        self.assertEqual(self.restart().tick(), 'deployment_running')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'pending')
+
+    def test_new_observations_use_execution_time_instead_of_run_id_order(self):
+        self.enable_manual_attempts()
+        self.watcher.state.update(last_observed_run=[102, 1],
+                                  observed_run_attempts={'101': 1, '102': 1},
+                                  last_observed_run_time=1735689660.0)
+        self.watcher.save()
+        older = self.github.run(run_id=101, status='completed', conclusion='success')
+        older.update(run_attempt=2, updated_at='2025-01-01T00:03:00Z')
+        self.bind_attempt(101, 2)
+        self.github.run(run_id=103, status='completed', conclusion='failure',
+                        created_at='2025-01-01T00:02:00Z')
+        self.bind_attempt(103)
+        self.assertEqual(self.watcher.tick(), 'current')
+        self.assertEqual(self.watcher.state['last_deployment_run_id'], 101)
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'success')
+        self.assertEqual(self.restart().tick(), 'current')
+
+    def test_per_run_attempt_history_is_bounded_and_persisted_values_are_validated(self):
+        self.enable_manual_attempts()
+        self.watcher.state['last_deployment_run_id'] = 200
+        self.watcher.save()
+        for identifier in range(1, 141):
+            self.github.run(run_id=identifier, status='completed', conclusion='failure')
+        self.assertEqual(self.watcher.tick(), 'current')
+        state = watch.read_state(self.path)
+        self.assertEqual(len(state['observed_run_attempts']), watch.MAX_OBSERVED_RUNS)
+        self.assertEqual(state['observed_run_attempts']['140'], 1)
+        for invalid in ({'../escape': 1}, {'101': True}, {'101': 0}, {'101': 10**10}):
+            with self.subTest(invalid=invalid):
+                changed = dict(state, observed_run_attempts=invalid)
+                watch.save_state(self.path, changed)
+                with self.assertRaises(watch.WatchError):
+                    watch.read_state(self.path)
+
+    def test_manual_green_without_controller_attempt_binding_is_rejected(self):
+        self.enable_manual_attempts()
+        run = self.github.run(run_id=101, status='completed', conclusion='success')
+        run['display_title'] = 'deploy-current-master'
+        self.assertEqual(self.watcher.tick(), 'latest_deployment_failed')
+        self.assertEqual(self.github.statuses[-1][1]['state'], 'failure')
+
+    def test_blank_manual_queued_run_uses_exact_resolved_binding_after_source_push(self):
+        self.enable_manual_attempts()
+        run = self.github.run(run_id=101, status='queued')
+        run['display_title'] = 'deploy-current-master'
+        self.assertEqual(self.watcher.tick(), 'deployment_running')
+        self.github.sha = B
+        self.bind_attempt(sha=B)
+        run.update(status='in_progress')
+        self.assertEqual(self.watcher.tick(), 'deployment_running')
+        self.assertEqual(self.watcher.state['inflight']['sha'], B)
+        run.update(status='completed', conclusion='success')
+        self.assertEqual(self.watcher.tick(), 'current')
+        self.assertEqual(self.watcher.state['deployed_sha'], B)
+        self.assertFalse(self.github.dispatches)
+
+    def test_logs_only_and_malformed_attempts_cannot_override_deployment_status(self):
+        self.enable_manual_attempts()
+        replay = self.github.run(run_id=101)
+        replay['display_title'] = 'logs-' + A
+        malformed = self.github.run(run_id=102)
+        malformed['run_attempt'] = '../escape'
+        self.assertEqual(self.watcher.tick(), 'current')
+        self.assertIsNone(self.watcher.state['inflight'])
+        self.assertFalse(self.github.dispatches)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

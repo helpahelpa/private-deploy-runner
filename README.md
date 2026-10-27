@@ -26,12 +26,37 @@ host broker must independently validate the strict lowercase 40-character SHA,
 allowlisted source identity, and current source master before running its fixed
 pipeline. Source code and tests run only inside the restricted build container,
 without GitHub tokens or host credentials. A successful workflow must mean the
-requested SHA actually passed QA and became active; a stale request must fail.
+requested SHA actually passed QA and a healthy replacement container became
+active with the previous server stopped; a stale request must fail.
+
+Use **Actions → Main deployment → Run workflow** to run the entire pipeline.
+Leave `source_sha` blank to resolve current source `master` on the trusted host.
+An explicit SHA must still be current `master`. Each GitHub run and retry gets
+its own numeric `run-id`/`run-attempt` identity, immutable logs, tested artifacts,
+and deployment receipt. A new attempt rebuilds and reruns tests even if that
+commit is already active. Materially unchanged signed APKs remain byte-identical
+through the separate native APK cache.
+
+The workflow stays running until registry synchronization and independent live
+replacement verification finish. Build/test errors, failed handoff, unhealthy
+replacement, registry errors, code rollback, and interrupted attempts fail the
+run. A healthy old server restored by rollback never makes the failed run green.
+Same-commit redeployment uses the normal fenced handoff and data-preserving
+snapshot checks, creates a new container, and verifies that its predecessor stopped.
+Set `require_request_id_for_submit: true` in production broker configuration.
+Historical pre-upgrade workflows then fail closed instead of replaying a cached
+success; create a new run using the current workflow to get the new behavior.
+Historical status and log reads remain available.
 
 ## Build and test logs
 
-Expand the deployment job's **Verify and deploy current source master** step for
-live compiler, image-build, and individual test output. Failures retain their
+The workflow displays separate **Build and test server, client and transport**,
+**Replace the active server**, and **Verify healthy replacement and stopped
+previous server** steps. Builds and tests overlap in restricted containers, so
+the first step reports that combined phase accurately. Expand each step for
+live compiler, image-build, individual test output, and handoff/health milestones.
+Its summary also records the resolved commit, attempt and current phase.
+Failures retain their
 sanitized diagnostic output before the job fails. Successful client regressions
 also retain their original output in the immutable private build cache.
 
@@ -41,8 +66,8 @@ terminal controls are filtered before a line enters that journal. Raw diagnostic
 remain private. Logs are bounded to 2 MiB and are available in GitHub's normal job
 log download; the source container receives neither the journal nor credentials.
 
-Cached builds clearly label their replayed results; they do not claim to rerun
-tests. For an existing job, manually run the workflow with `logs_only` enabled
+Legacy cached builds clearly label replayed results; new deployment attempts
+always rerun tests. For a historical SHA-only job, run with `logs_only` enabled
 and its original source SHA. The **Show recorded build and test logs** step reads
 logs without building, deploying, changing job status, or checking out game code.
 Its run name starts with `logs-`, so the automatic watcher cannot mistake it for
@@ -86,7 +111,11 @@ example identities with GitHub's numeric repository and owner IDs. Set
 `state_file` to durable private storage. Set the watcher's optional
 `desired_commit_file` to the same absolute private path required by the engine.
 The watcher atomically publishes verified master there on every poll, including
-during a running build, without rewriting an unchanged SHA. Keep actual machine names, network
+during a running build, without rewriting an unchanged SHA. Set
+`attempt_bindings` to the broker's private `attempts` directory so manual runs
+and same-run retry attempts update source commit status, including failure of
+a redeployment of an already deployed commit. An older success cannot overwrite
+the new attempt's pending or failed status. Keep actual machine names, network
 addresses, filesystem locations, and credentials out of tracked files. The host
 account's `gh` identity needs to read the source repository and dispatch/read
 actions in this controller repository. Never copy that authentication into either

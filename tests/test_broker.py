@@ -63,6 +63,119 @@ class FakeOperations:
         self.finalized.append(sha)
 
 
+class AttemptOperations(FakeOperations):
+    def build(self,sha,version,stage,*,request_id=None):
+        release=super().build(sha,version,stage)
+        return release/str(request_id)
+
+    def promote(self,sha,release,*,replace_same_commit=False):
+        if not replace_same_commit:raise AssertionError('Attempt must replace the container')
+        super().promote(sha,release)
+        return {'id':'d'*32,'phase':'healthy','container':'e'*64,'from_container':'f'*64,
+                'release_path':str(release),'to':sha,'old_stopped':True}
+
+    def verify_replacement(self,sha,release,proof):
+        return proof['container']!=proof['from_container'] and proof['release_path']==str(release)
+
+
+class AttemptBrokerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);token=self.root/'token';token.write_text(TOKEN);token.chmod(0o600)
+        self.config={'local_root':self.root/'state','token_file':token,'minimum_version':63}
+        self.ops=AttemptOperations();self.broker=broker.Broker(self.config,self.ops)
+
+    def request(self,operation='submit',sha='',request_id='12345-1',**extra):
+        return self.broker.handle(dict(op=operation,sha=sha,request_id=request_id,token=TOKEN,**extra))
+
+    def process(self,request_id='12345-1'):
+        self.broker.process(broker.job_key(A,request_id))
+
+    def test_manual_submit_resolves_master_and_same_id_is_idempotent_after_master_moves(self):
+        first=self.request();self.ops.master=B;second=self.request()
+        self.assertEqual(first,second)
+        self.assertEqual((A,'12345-1','queued'),(first['sha'],first['request_id'],first['phase']))
+        self.assertEqual(1,self.broker.pending.qsize())
+        with self.assertRaises(broker.BrokerError):self.request(sha=B)
+        for value in ('','0-1','1-0','1/2','../private',True,None,'9'*21+'-1','1-'+'9'*11):
+            with self.subTest(value=value),self.assertRaises(broker.BrokerError):self.request(request_id=value)
+
+    def test_production_policy_rejects_legacy_submit_but_keeps_historical_reads(self):
+        legacy=dict(op='submit',sha=A,token=TOKEN)
+        self.broker.handle(legacy)
+        self.config['require_request_id_for_submit']=True
+        with self.assertRaises(broker.BrokerError):self.broker.handle(legacy)
+        self.assertEqual('queued',self.broker.handle(dict(legacy,op='status'))['status'])
+        self.assertEqual('',self.broker.handle(dict(legacy,op='logs',cursor=0))['text'])
+        self.assertEqual('queued',self.request()['status'])
+
+    def test_each_attempt_builds_and_replaces_even_when_sha_already_active(self):
+        self.ops.active=A
+        for request_id in ('12345-1','12345-2'):
+            self.request(request_id=request_id);self.process(request_id)
+            result=self.request('status',sha=A,request_id=request_id)
+            self.assertEqual('success',result['status']);self.assertEqual('complete',result['phase'])
+            self.assertIs(result['replacement_verified'],True)
+        self.assertEqual([(A,63),(A,64)],self.ops.builds)
+        self.assertEqual([A,A],self.ops.promotions)
+        self.assertNotEqual(self.broker.path(A,'12345-1'),self.broker.path(A,'12345-2'))
+        self.assertEqual('success',self.request(sha=A)['status'])
+        self.assertEqual(2,len(self.ops.builds))
+
+    def test_failed_attempt_never_retries_or_turns_green_from_same_sha(self):
+        self.ops.active=A;self.ops.fail=True
+        self.request();self.process()
+        job_before=self.broker.path(A,'12345-1').read_bytes()
+        self.assertEqual('failed',self.request(sha=A)['status'])
+        self.assertEqual(job_before,self.broker.path(A,'12345-1').read_bytes())
+        self.ops.fail=False;self.request(request_id='12345-2');self.process('12345-2')
+        self.assertEqual('success',self.request('status',sha=A,request_id='12345-2')['status'])
+        self.assertEqual('failed',self.request('status',sha=A)['status'])
+
+    def test_attempt_logs_and_status_cannot_read_another_attempt_or_sha(self):
+        self.request();self.request(request_id='12345-2')
+        for request_id,text in (('12345-1','first attempt\n'),('12345-2','second attempt\n')):
+            directory=self.broker.root/'public-logs'/broker.job_key(A,request_id);directory.mkdir(parents=True)
+            (directory/'journal.log').write_text(text);(directory/'journal.log').chmod(0o600)
+            self.assertEqual(text,self.request('logs',sha=A,request_id=request_id,cursor=0)['text'])
+        for kwargs in ({'sha':B},{'request_id':'99999-1'},{'sha':''}):
+            with self.subTest(kwargs=kwargs),self.assertRaises(broker.BrokerError):self.request('status',sha=kwargs.get('sha',A),request_id=kwargs.get('request_id','12345-1'))
+
+    def test_live_phase_is_available_before_terminal_status(self):
+        self.request()
+        for stage,phase in (('source','building'),('client','building_testing'),('promote','deploying'),('verify','verifying')):
+            self.broker.stage(broker.job_key(A,'12345-1'),stage)
+            result=self.request('status',sha=A)
+            self.assertEqual(phase,result['phase']);self.assertEqual('running',result['status'])
+
+    def test_interrupted_attempt_is_failed_even_when_same_sha_is_healthy(self):
+        for stage in ('client','promote','verify'):
+            request_id='12345-'+str(('client','promote','verify').index(stage)+1)
+            self.request(request_id=request_id);self.broker.stage(broker.job_key(A,request_id),stage)
+            self.ops.active=A;restarted=broker.Broker(self.config,self.ops)
+            self.assertEqual('failed',restarted.load(A,request_id)['status'])
+            self.broker=restarted
+
+    def test_finalize_or_replacement_proof_failure_cannot_report_success(self):
+        for method in ('finalize','verify_replacement'):
+            request_id='12345-'+str(('finalize','verify_replacement').index(method)+1)
+            self.request(request_id=request_id)
+            with patch.object(self.ops,method,side_effect=ValueError('Fixture verification failure')):
+                self.process(request_id)
+            self.assertEqual('failed',self.request('status',sha=A,request_id=request_id)['status'])
+            self.assertEqual(A,self.ops.active)
+
+    def test_final_status_rechecks_current_replacement_but_historical_logs_stay_readonly(self):
+        self.request();self.process()
+        path=self.broker.path(A,'12345-1');before=path.read_bytes()
+        with patch.object(self.ops,'verify_replacement',return_value=False):
+            final=self.request('status',sha=A)
+            self.assertEqual('failed',final['status']);self.assertIs(final['replacement_verified'],False)
+        with patch.object(self.ops,'verify_replacement',side_effect=AssertionError('Historical logs queried runtime')):
+            self.assertEqual('success',self.request('logs',sha=A,cursor=0)['status'])
+        self.assertEqual(before,path.read_bytes())
+
+
 class BrokerTests(unittest.TestCase):
     def test_public_controller_still_requires_exact_repository_identity(self):
         from unittest.mock import Mock
@@ -217,12 +330,12 @@ class BrokerTests(unittest.TestCase):
         restarted.process(A)
         self.assertEqual(restarted.load(A)["status"], "success")
 
-    def test_handoff_crash_accepts_only_verified_exact_active_commit(self):
+    def test_handoff_crash_does_not_turn_sha_equality_into_success(self):
         self.request()
         self.broker.stage(A, "promote")
         self.ops.active = A
         restarted = broker.Broker(self.config, self.ops)
-        self.assertEqual(restarted.load(A)["status"], "success")
+        self.assertEqual(restarted.load(A)["status"], "failed")
         self.assertTrue(restarted.pending.empty())
         self.assertEqual(self.ops.finalized, [A])
 
@@ -426,6 +539,19 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(release, operations.cached(A) / "release")
         receipt = json.loads((release.parent / "receipt.json").read_text())
         self.assertIn("transport/transport.json", receipt["files"])
+        original=broker.engine.tree(release.parent)
+        for request_id,version in (('45678-1',64),('45678-2',65)):
+            with patch.object(operations,'cached',side_effect=AssertionError('Fresh attempt used SHA artifacts')), \
+                    patch.object(operations,'source',return_value=self.root) as source, \
+                    patch.object(operations,'command',side_effect=client_command), \
+                    patch.object(broker.engine,'build_server',side_effect=build_server), \
+                    patch.object(broker.engine,'assemble',side_effect=assemble):
+                fresh=operations.build(A,version,lambda _:None,request_id=request_id)
+                source.assert_called_once_with(A,request_id=request_id)
+            self.assertEqual(operations.root/'builds'/broker.job_key(A,request_id)/'release',fresh)
+            self.assertEqual(request_id,json.loads((fresh.parent/'receipt.json').read_text())['request_id'])
+            self.assertEqual(original,broker.engine.tree(release.parent))
+        self.assertEqual(3,len(assembled))
 
     def test_public_apk_metadata_cannot_advertise_a_different_signed_artifact(self):
         client = self.root / 'metadata-client'
@@ -614,6 +740,44 @@ class BrokerTests(unittest.TestCase):
             operations.promote(A, Path("/private/release"))
             runtime.promote.assert_not_called()
             git.assert_not_called()
+
+    def test_explicit_same_commit_replacement_keeps_current_master_authority(self):
+        operations=broker.Operations(dict(self.config,engine_config=self.root/'engine.json'))
+        with patch.object(broker.engine,'Engine') as factory,patch.object(operations,'git') as git, \
+                patch.object(operations,'current',return_value=A) as current:
+            runtime=factory.return_value;runtime.c={'desired_commit_file':self.root/'desired'}
+            runtime.status.return_value={'managed_release':A}
+            runtime.promote.return_value={'phase':'healthy'}
+            self.assertEqual({'phase':'healthy'},operations.promote(A,self.root/'fresh-release',replace_same_commit=True))
+            runtime.promote.assert_called_once_with(self.root/'fresh-release',A,replace_same_commit=True)
+            current.assert_called_once_with();git.assert_not_called()
+            self.assertEqual(A+'\n',(self.root/'desired').read_text())
+
+    def test_replacement_verification_requires_exact_healthy_receipt_cid_and_stopped_old_world(self):
+        operations=broker.Operations(self.config)
+        release=(self.root/'release').resolve()
+        proof={'id':'1'*32,'phase':'healthy','to':A,'old_stopped':True,'rollback':False,'replace_same_commit':True,
+               'release_path':str(release),'previous_release_path':str(self.root/'old'),
+               'container':'2'*64,'from_container':'3'*64}
+        runtime_root=self.root/'runtime';(runtime_root/'deployments').mkdir(parents=True)
+        receipt=runtime_root/'deployments'/(proof['id']+'.json');broker.engine.write_json(receipt,proof)
+        with patch.object(broker.engine,'Engine') as factory:
+            runtime=factory.return_value;runtime.root=runtime_root
+            runtime.status.return_value={'managed_release':A}
+            active={'release':A,'container':proof['container'],'release_path':str(release)}
+            runtime.active.return_value=active;runtime.inspect.return_value={'State':{'Running':False}}
+            self.assertIs(operations.verify_replacement(A,release,proof),True)
+            for change in ({'container':'4'*64},{'release_path':str(self.root/'other')},{'release':B}):
+                runtime.active.return_value=dict(active,**change)
+                with self.subTest(change=change),self.assertRaises(broker.BrokerError):operations.verify_replacement(A,release,proof)
+            runtime.active.return_value=active;runtime.inspect.return_value={'State':{'Running':True}}
+            with self.assertRaises(broker.BrokerError):operations.verify_replacement(A,release,proof)
+            runtime.inspect.return_value={'State':{'Running':False}}
+            for change in ({'phase':'rolled_back_code_only'},{'container':proof['from_container']},
+                           {'release_path':proof['previous_release_path']},{'old_stopped':False},{'replace_same_commit':False}):
+                with self.subTest(change=change),self.assertRaises(broker.BrokerError):operations.verify_replacement(A,release,dict(proof,**change))
+            broker.engine.write_json(receipt,dict(proof,phase='rolled_back_code_only'))
+            with self.assertRaises(broker.BrokerError):operations.verify_replacement(A,release,proof)
 
     def test_current_master_is_reverified_before_publishing_promotion_authority(self):
         desired = self.root / "desired-master"

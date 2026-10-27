@@ -27,9 +27,27 @@ import native_apk
 import watch_master as watch
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+REQUEST_ID = re.compile(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,9}\Z")
 LFS_POINTER = re.compile(rb"version https://git-lfs.github.com/spec/v1\noid sha256:([0-9a-f]{64})\nsize ([0-9]+)\n\Z")
 LIMIT = 4096
 PRIVATE = Path(__file__).resolve().parents[1]
+
+
+def job_key(sha, request_id=None):
+    require(isinstance(sha, str) and SHA.fullmatch(sha))
+    if request_id is None:
+        return sha
+    require(isinstance(request_id, str) and REQUEST_ID.fullmatch(request_id))
+    return sha + '--' + request_id
+
+
+def job_identity(key):
+    require(isinstance(key,str))
+    values=key.split('--')
+    require(len(values) in (1,2))
+    sha=values[0];request_id=values[1] if len(values)==2 else None
+    require(job_key(sha,request_id)==key)
+    return sha,request_id
 
 
 @contextmanager
@@ -84,6 +102,7 @@ def config_read(path):
     require(isinstance(aliases, dict) and all(isinstance(a, str) and SHA.fullmatch(a)
             and isinstance(b, str) and SHA.fullmatch(b) for a, b in aliases.items()))
     require(type(value.get("publish_apk", True)) is bool)
+    require(type(value.get('require_request_id_for_submit',False)) is bool)
     require(type(value.get("control_private", True)) is bool)
     if value.get("static_assets"):
         base = value["static_assets"]
@@ -253,7 +272,7 @@ class Operations:
             shutil.copyfile(source, target)
             target.chmod(0o400)
 
-    def source(self, sha):
+    def source(self, sha, request_id=None):
         cache = self.c["source_cache"]
         cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         require(not cache.is_symlink())
@@ -267,8 +286,9 @@ class Operations:
         remote = "git@github.com:" + self.c["source"].full_name + ".git"
         self.git("--git-dir=" + str(cache), "fetch", "--no-tags", "--no-recurse-submodules", remote, sha)
         require(self.git("--git-dir=" + str(cache), "rev-parse", sha + "^{commit}").decode().strip() == sha)
-        destination = self.root / "work" / sha
+        destination = self.root / "work" / job_key(sha, request_id)
         if destination.exists():
+            require(request_id is None)
             shutil.rmtree(destination)
         destination.mkdir(parents=True, mode=0o700)
         entries = self.git("--git-dir=" + str(cache), "ls-tree", "-rz", "--full-tree", sha).split(b"\0")
@@ -316,22 +336,24 @@ class Operations:
         require(files == value["files"])
         return cache
 
-    def build(self, sha, version, stage):
-        with public_logging(self.c, sha):
-            return self._build(sha, version, stage)
+    def build(self, sha, version, stage, *, request_id=None):
+        with public_logging(self.c, job_key(sha, request_id)):
+            return self._build(sha, version, stage, request_id=request_id)
 
-    def _build(self, sha, version, stage):
-        cached = self.cached(sha)
+    def _build(self, sha, version, stage, *, request_id=None):
+        key = job_key(sha, request_id)
+        cached = self.cached(sha) if request_id is None else None
         if cached:
             build_logs.emit("Reusing verified cached artifacts; recorded test results follow. Tests are not being rerun.")
             self.replay_logs(cached)
             return cached / "release"
         build_logs.emit("Fetching exact source commit " + sha)
-        source = self.source(sha)
+        source = self.source(sha) if request_id is None else self.source(sha, request_id=request_id)
         builds = self.root / "builds"
         builds.mkdir(parents=True, exist_ok=True, mode=0o700)
-        scratch = builds / (sha + ".incomplete")
+        scratch = builds / (key + ".incomplete")
         if scratch.exists():
+            require(request_id is None)
             shutil.rmtree(scratch)
         scratch.mkdir(mode=0o700)
         # Only fixed build/check operations overlap. All finish before assets
@@ -386,8 +408,8 @@ class Operations:
         engine.write_json(provenance, {"commit": sha, "tested": True, "files": engine.tree(assets),
                                        "tests_receipt_sha256": engine.digest(receipt)})
         engine.assemble(scratch / "server", assets, provenance, receipt, scratch / "release")
-        engine.write_json(scratch / "receipt.json", {"sha": sha, "version": version, "files": engine.tree(scratch)})
-        destination = builds / sha
+        engine.write_json(scratch / "receipt.json", {"sha": sha, "request_id":request_id,"version": version, "files": engine.tree(scratch)})
+        destination = builds / key
         require(not destination.exists())
         os.replace(scratch, destination)
         build_logs.emit("Signed client and matching server/assets verified and assembled successfully.")
@@ -427,22 +449,24 @@ class Operations:
                     == self.git("--git-dir=" + str(self.c["source_cache"]), "rev-parse", base + "^{tree}"))
         self.git("--git-dir=" + str(self.c["source_cache"]), "merge-base", "--is-ancestor", base, target)
 
-    def promote(self, sha, release):
+    def promote(self, sha, release, *, replace_same_commit=False):
         runtime = engine.Engine(self.c["engine_config"])
         current = runtime.status()["managed_release"]
         require(isinstance(current, str) and SHA.fullmatch(current)
                 and isinstance(sha, str) and SHA.fullmatch(sha))
-        if current != sha:
+        if current != sha or replace_same_commit:
             # Automatic promotion only advances the active source history.
             # Explicit operator rollbacks remain an engine-only operation.
-            self.check_successor(current, sha)
+            if current != sha:self.check_successor(current, sha)
             authority = runtime.c.get("desired_commit_file")
             require(authority is not None and Path(authority).is_absolute())
             require(self.current() == sha)
             watch.save_desired(authority, sha)
             try:
-                runtime.promote(release, current)
+                result = (runtime.promote(release, current, replace_same_commit=True) if replace_same_commit
+                          else runtime.promote(release, current))
                 require(runtime.status()["managed_release"] == sha)
+                return result
             except Exception:
                 # Code rollback can replace the active container. Synchronize
                 # registries with whichever exact release is actually healthy,
@@ -454,6 +478,24 @@ class Operations:
                 except Exception:
                     raise PromotionRecoveryRequired("promotion recovery required") from None
                 raise
+
+    def verify_replacement(self, sha, release, proof):
+        require(isinstance(proof,dict) and re.fullmatch(r'[0-9a-f]{32}',proof.get('id',''))
+                and proof.get('phase')=='healthy' and proof.get('to')==sha and proof.get('old_stopped') is True
+                and proof.get('replace_same_commit') is True and proof.get('rollback') is False
+                and proof.get('release_path')==str(Path(release).resolve())
+                and proof.get('previous_release_path')!=proof.get('release_path')
+                and proof.get('from_container')!=proof.get('container')
+                and re.fullmatch(r'[0-9a-f]{64}',proof.get('container',''))
+                and re.fullmatch(r'[0-9a-f]{64}',proof.get('from_container','')))
+        runtime=engine.Engine(self.c['engine_config'])
+        require(json.loads((runtime.root/'deployments'/(proof['id']+'.json')).read_text())==proof)
+        require(runtime.status()['managed_release']==sha)
+        active=runtime.active()
+        require(active['release']==sha and active['container']==proof['container']
+                and active['release_path']==proof['release_path']
+                and not runtime.inspect(proof['from_container'])['State']['Running'])
+        return True
 
     def finalize(self, sha):
         # This fixed private script is the only optional registry callback. The
@@ -478,56 +520,78 @@ class Broker:
         self.pending = queue.Queue()
         self.recover()
 
-    def path(self, sha):
-        require(isinstance(sha, str) and SHA.fullmatch(sha))
-        return self.jobs / (sha + ".json")
+    def path(self, sha, request_id=None):
+        return self.jobs / (job_key(sha,request_id) + ".json")
 
-    def load(self, sha):
-        path = self.path(sha)
+    def load(self, sha, request_id=None):
+        path = self.path(sha,request_id)
         return json.loads(path.read_text()) if path.exists() else None
 
+    def load_key(self,key):
+        return self.load(*job_identity(key))
+
     def save(self, job):
-        watch.save_state(self.path(job["sha"]), job)
+        watch.save_state(self.path(job["sha"],job.get('request_id')), job)
 
     def recover(self):
         for path in sorted(self.jobs.glob("*.json")):
-            require(SHA.fullmatch(path.stem))
-            job = self.load(path.stem)
-            require(job["sha"] == path.stem and job["status"] in ("queued", "running", "success", "failed"))
+            sha,request_id=job_identity(path.stem)
+            job = self.load(sha,request_id)
+            require(job["sha"] == sha and job.get('request_id')==request_id and job["status"] in ("queued", "running", "success", "failed"))
             if job["status"] == "running":
-                if job["stage"] in ("promote", "verify"):
+                if request_id is not None or job["stage"] in ("promote", "verify"):
                     try:
                         actual = self.operations.status()
                         require(isinstance(actual, str) and SHA.fullmatch(actual))
                         self.operations.finalize(actual)
-                        active = actual == job["sha"] and self.operations.status() == job["sha"]
+                        healthy = self.operations.status() == actual
                     except Exception:
-                        active = False
-                    job.update(status="success" if active else "failed", stage="complete" if active else "failed",
-                               recovery_required=not active)
+                        healthy = False
+                    # SHA equality cannot prove which container won an interrupted
+                    # handoff, especially when replacing the same commit.
+                    job.update(status="failed",stage="failed",recovery_required=not healthy or actual!=job['sha'])
                 else:
                     job.update(status="queued", stage="queued")
                 self.save(job)
             if job["status"] == "queued":
-                self.pending.put(job["sha"])
+                self.pending.put(path.stem)
 
     def public(self, job):
-        return {name: job[name] for name in ("sha", "status", "stage")}
+        result={name: job[name] for name in ("sha", "status", "stage")}
+        phase={'source':'building','server':'building_testing','client':'building_testing',
+               'transport':'building_testing','assemble':'building_testing','promote':'deploying','verify':'verifying'}.get(job['stage'],job['stage'])
+        if job.get('request_id') is not None:
+            result['phase']=phase
+            result['request_id']=job['request_id']
+            result['replacement_verified']=job.get('replacement_verified',False)
+        return result
 
     def handle(self, request):
         require(isinstance(request, dict))
         operation = request.get("op")
         expected = {"op", "sha", "token", "cursor"} if operation == "logs" else {"op", "sha", "token"}
+        if 'request_id' in request:expected.add('request_id')
         require(set(request) == expected)
         require(isinstance(request["token"], str) and hmac.compare_digest(request["token"], self.token))
         require(operation in ("submit", "status", "logs"))
         if operation == "logs":
             require(type(request["cursor"]) is int and 0 <= request["cursor"] < (1 << 63))
+        request_id=request.get('request_id')
+        if 'request_id' in request:require(isinstance(request_id,str) and REQUEST_ID.fullmatch(request_id))
+        require(operation!='submit' or not self.c.get('require_request_id_for_submit',False) or request_id is not None)
         sha = request["sha"]
-        self.path(sha)
         with self.mutex:
-            job = self.load(sha)
-            if operation != "logs" and job is not None and job["status"] == "success":
+            if sha=='' and operation=='submit' and request_id is not None:
+                binding=self.root/'attempts'/(request_id+'.json')
+                sha=json.loads(binding.read_text())['sha'] if binding.exists() else self.operations.current()
+            key=job_key(sha,request_id)
+            if request_id is not None:
+                binding=self.root/'attempts'/(request_id+'.json')
+                if binding.exists():require(json.loads(binding.read_text())=={'sha':sha,'request_id':request_id})
+                elif operation=='submit':watch.save_state(binding,{'sha':sha,'request_id':request_id})
+                else:require(False)
+            job = self.load(sha,request_id)
+            if request_id is None and operation != "logs" and job is not None and job["status"] == "success":
                 # A historical receipt is not proof that the release is active
                 # now, including after an operator rollback or later deployment.
                 try:
@@ -537,7 +601,7 @@ class Broker:
                 if not active:
                     job.update(status="failed", stage="failed")
                     self.save(job)
-            if request["op"] == "submit" and (job is None or (job["status"] == "failed" and not job.get("recovery_required"))):
+            if request["op"] == "submit" and (job is None or (request_id is None and job["status"] == "failed" and not job.get("recovery_required"))):
                 # An allocation is persisted before starting any client build and
                 # is reused on restart. Failed builds never recycle a version.
                 counter = self.root / "version.json"
@@ -546,24 +610,39 @@ class Broker:
                 require(version <= 2147483647)
                 watch.save_state(counter, {"last": version})
                 job = {"sha": sha, "status": "queued", "stage": "queued", "version": version}
+                if request_id is not None:job['request_id']=request_id
                 self.save(job)
-                self.pending.put(sha)
+                self.pending.put(key)
             require(job is not None)
             result = self.public(job)
+            if request_id is not None and operation!='logs' and job['status']=='success':
+                try:
+                    verified=self.operations.verify_replacement(sha,Path(job['release_path']),job['promotion']) is True
+                except Exception:
+                    verified=False
+                if not verified:
+                    # Keep historical logs/receipt intact, but never let a final
+                    # runner status poll attest to a different current container.
+                    result.update(status='failed',stage='failed',phase='failed',replacement_verified=False)
             if operation == "logs":
                 import build_logs
-                result.update(build_logs.read_page(self.root / "public-logs" / sha / "journal.log", request["cursor"]))
+                result.update(build_logs.read_page(self.root / "public-logs" / key / "journal.log", request["cursor"]))
             return result
 
     def stage(self, sha, stage):
         with self.mutex:
-            job = self.load(sha)
+            job = self.load_key(sha)
             job.update(status="running", stage=stage)
             self.save(job)
             build_logs.emit("Stage: " + stage)
 
     def process(self, sha):
         try:
+            with self.mutex:
+                job=self.load_key(sha)
+                if job.get('request_id') is not None and job['status']!='queued':return
+                if job.get('request_id') is not None:
+                    job.update(status='running',stage='source');self.save(job)
             with public_logging(self.c, sha):
                 self._process(sha)
         except Exception as error:
@@ -573,24 +652,35 @@ class Broker:
 
     def _process(self, sha):
         try:
-            self.stage(sha, "source")
+            key=sha
+            sha,request_id=job_identity(key)
+            self.stage(key, "source")
             require(self.operations.current() == sha)
             self.operations.preflight()
-            job = self.load(sha)
-            release = self.operations.build(sha, job["version"], lambda stage: self.stage(sha, stage))
+            job = self.load(sha,request_id)
+            build_args=(sha,job['version'],lambda stage:self.stage(key,stage))
+            release = (self.operations.build(*build_args,request_id=request_id) if request_id is not None
+                       else self.operations.build(*build_args))
             require(self.operations.current() == sha)
-            self.stage(sha, "promote")
-            self.operations.promote(sha, release)
-            self.stage(sha, "verify")
+            self.stage(key, "promote")
+            if request_id is not None:
+                proof=self.operations.promote(sha,release,replace_same_commit=True)
+                with self.mutex:
+                    job=self.load(sha,request_id);job.update(release_path=str(Path(release).resolve()),promotion=proof);self.save(job)
+            else:self.operations.promote(sha, release)
+            self.stage(key, "verify")
             self.operations.finalize(sha)
             require(self.operations.status() == sha)
+            if request_id is not None:require(self.operations.verify_replacement(sha,release,proof) is True)
             with self.mutex:
-                job = self.load(sha)
+                job = self.load(sha,request_id)
+                require(job['status']=='running')
                 job.update(status="success", stage="complete")
+                if request_id is not None:job['replacement_verified']=True
                 self.save(job)
                 build_logs.emit("Deployment complete: exact requested commit is active and healthy.")
         except Exception as error:
-            self.record_failure(sha, error)
+            self.record_failure(key, error)
 
     def record_failure(self, sha, error):
         # Full diagnostics are host-private, never sent through IPC.
@@ -598,7 +688,7 @@ class Broker:
         with os.fdopen(descriptor, "a") as log:
             traceback.print_exc(file=log)
         with self.mutex:
-            job = self.load(sha)
+            job = self.load_key(sha)
             job.update(status="failed", stage="failed")
             try:
                 build_logs.emit("Deployment failed; see the preceding build/test output. Private operator diagnostics are retained.")
