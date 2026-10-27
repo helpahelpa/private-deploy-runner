@@ -17,12 +17,16 @@ MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_LOG_PAGES = 8192
 
 
-def request(config, token, operation, sha, cursor=None, *, request_id=None):
+def request(config, token, operation, sha, cursor=None, *, request_id=None, force_full_qa=None):
     payload = {"token": token, "op": operation, "sha": sha}
     if request_id is not None:
         if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
             raise ValueError("invalid deployment attempt")
         payload["request_id"] = request_id
+    if force_full_qa is not None:
+        if operation != "submit" or request_id is None or type(force_full_qa) is not bool:
+            raise ValueError("invalid QA policy")
+        payload["force_full_qa"] = force_full_qa
     if operation == "logs":
         if type(cursor) is not int or not 0 <= cursor <= MAX_CURSOR:
             raise ValueError("invalid log cursor")
@@ -47,6 +51,10 @@ def request(config, token, operation, sha, cursor=None, *, request_id=None):
     if request_id is not None and (data.get("request_id") != request_id or data.get("phase") not in PHASES
                                   or type(data.get("replacement_verified")) is not bool):
         raise ValueError("invalid deployment attempt status")
+    if "force_full_qa" in data and type(data["force_full_qa"]) is not bool:
+        raise ValueError("invalid QA policy")
+    if force_full_qa is not None and data.get("force_full_qa") is not force_full_qa:
+        raise ValueError("QA policy not acknowledged")
     if operation == "logs":
         if (not isinstance(data.get("text"), str) or type(data.get("cursor")) is not int
                 or not 0 <= data["cursor"] <= MAX_CURSOR or type(data.get("more")) is not bool):
@@ -118,7 +126,7 @@ def show_logs(config, sha):
     return 0
 
 
-def execute(config, sha, *, clock=time.monotonic, sleep=time.sleep, request_id=None):
+def execute(config, sha, *, clock=time.monotonic, sleep=time.sleep, request_id=None, force_full_qa=False):
     token = authenticate(config, sha, request_id)
     options = {"request_id": request_id} if request_id is not None else {}
     interval = config.get("poll_seconds", 2)
@@ -126,7 +134,12 @@ def execute(config, sha, *, clock=time.monotonic, sleep=time.sleep, request_id=N
     if type(interval) is not int or not 1 <= interval <= 30 or type(timeout) is not int or not 1 <= timeout <= 3500:
         raise ValueError("invalid timing")
     deadline = clock() + timeout
-    data = request(config, token, "submit", sha, **options)
+    if type(force_full_qa) is not bool or (force_full_qa and request_id is None):
+        raise ValueError("invalid QA policy")
+    submit_options = dict(options)
+    if force_full_qa:
+        submit_options["force_full_qa"] = True
+    data = request(config, token, "submit", sha, **submit_options)
     sha = data["sha"]
     previous = None
     output = BuildOutput(request_id)
@@ -166,20 +179,26 @@ def summarize(data):
               "testing": "Testing", "deploying": "Replacing the active server", "verifying": "Verifying the replacement",
               "complete": "Replacement deployed and verified", "failed": "Deployment failed"}
     label = labels[data["phase"]]
+    policy = "Full QA forced" if data.get("force_full_qa") else "Verified whole component reuse allowed"
     print("Pipeline phase: " + label, flush=True)
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
         # Only validated hashes, numeric attempt IDs and fixed labels enter Markdown.
         Path(path).write_text("## Main deployment\n\nSource: `" + data["sha"] + "`\n\nAttempt: `"
                               + data["request_id"] + "`\n\n**" + label + "**\n\n"
+                              + "QA policy: " + policy + ".\n\n"
                               + "Success requires a healthy new server container and the previous server stopped.\n")
 
 
-def start_attempt(config, sha, request_id, state_path, *, clock=time.time):
+def start_attempt(config, sha, request_id, state_path, *, clock=time.time, force_full_qa=False):
     token = authenticate(config, sha, request_id)
     if request_id is None:
         raise ValueError("workflow deployment attempt required")
-    data = request(config, token, "submit", sha, request_id=request_id)
+    if type(force_full_qa) is not bool:
+        raise ValueError("invalid QA policy")
+    print("QA policy: " + ("force full QA; component test caches bypassed" if force_full_qa
+                           else "verified whole client/server component reuse allowed"), flush=True)
+    data = request(config, token, "submit", sha, request_id=request_id, force_full_qa=force_full_qa)
     state = {"schema": 1, "sha": data["sha"], "request_id": request_id, "cursor": 0, "pending": "", "pages": 0,
              "started_at": clock()}
     save_progress(state_path, state)
@@ -251,7 +270,11 @@ def main():
             return wait_through(config, args.state, args.wait_through)
         if args.start:
             identifier = os.environ.get("GITHUB_RUN_ID", "") + "-" + os.environ.get("GITHUB_RUN_ATTEMPT", "")
-            return start_attempt(config, os.environ.get("SOURCE_SHA", ""), identifier, args.state)
+            policy = os.environ.get("FORCE_FULL_QA", "false")
+            if policy not in ("true", "false"):
+                raise ValueError("invalid QA policy")
+            return start_attempt(config, os.environ.get("SOURCE_SHA", ""), identifier, args.state,
+                                 force_full_qa=policy == "true")
         action = show_logs if args.logs_only else execute
         return action(config, os.environ.get("SOURCE_SHA"))
     except Exception:

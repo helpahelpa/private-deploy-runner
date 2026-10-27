@@ -33,9 +33,35 @@ Use **Actions → Main deployment → Run workflow** to run the entire pipeline.
 Leave `source_sha` blank to resolve current source `master` on the trusted host.
 An explicit SHA must still be current `master`. Each GitHub run and retry gets
 its own numeric `run-id`/`run-attempt` identity, immutable logs, tested artifacts,
-and deployment receipt. A new attempt rebuilds and reruns tests even if that
-commit is already active. Materially unchanged signed APKs remain byte-identical
-through the separate native APK cache.
+and deployment receipt. Each attempt assembles a new release and replaces the
+server even if that commit is already active. By default, it can reuse verified
+whole client and server components when their complete input fingerprints match.
+There are no per-test or feature-level caches. Materially unchanged signed APKs
+remain byte-identical through the separate native APK cache.
+
+Select **Force full QA** to bypass both component test caches and rerun the full
+client and server suites. Push-triggered runs use normal component reuse. A
+retry retains the original run's QA setting; start a new run to change it.
+Forced QA still reuses an unchanged signed APK and does not create an Android
+update just to rerun tests. Transport checks and final deployment verification
+run on every attempt.
+
+Client QA is configured for three independent restricted containers, and server
+QA for two. Each worker discovers the full suite and executes its assigned
+tests. The trusted controller checks that their combined result includes
+every expected test exactly once with no skips, failures, or errors. Workers
+have separate temporary filesystems; failed workers fail the entire build.
+Logs identify cache hits, fresh test runs, worker totals, and the original tested
+commit. Reused evidence is never presented as newly executed tests.
+
+The cache fingerprints include admitted source and tests, copied fixtures,
+trusted harness/build policy, pinned tools and images, and relevant private
+configuration. Client integration tests can read shared server code, so those
+inputs also invalidate the whole client cache. Cache entries are sealed only
+after success, hash-checked before reuse, and kept outside source/test mounts.
+Corrupt evidence fails the build. Server admission invariants, artifact hashes,
+handoff, live replacement health, and the stopped predecessor are checked for
+every deployment, including cache hits.
 
 The workflow stays running until registry synchronization and independent live
 replacement verification finish. Build/test errors, failed handoff, unhealthy
@@ -66,8 +92,8 @@ terminal controls are filtered before a line enters that journal. Raw diagnostic
 remain private. Logs are bounded to 2 MiB and are available in GitHub's normal job
 log download; the source container receives neither the journal nor credentials.
 
-Legacy cached builds clearly label replayed results; new deployment attempts
-always rerun tests. For a historical SHA-only job, run with `logs_only` enabled
+Cached components clearly label reused results; **Force full QA** executes all
+client and server tests again. For a historical SHA-only job, run with `logs_only` enabled
 and its original source SHA. The **Show recorded build and test logs** step reads
 logs without building, deploying, changing job status, or checking out game code.
 Its run name starts with `logs-`, so the automatic watcher cannot mistake it for

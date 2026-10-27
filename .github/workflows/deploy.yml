@@ -13,6 +13,10 @@ on:
         description: Show recorded build/test logs without deploying
         type: boolean
         default: false
+      force_full_qa:
+        description: Rerun all client and server tests instead of reusing verified components
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -38,6 +42,7 @@ jobs:
         if: ${{ !inputs.logs_only }}
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          FORCE_FULL_QA: ${{ inputs.force_full_qa }}
         run: python3 scripts/pipeline.py --config /config/pipeline.json --start
       - name: Build and test server, client and transport
         if: ${{ !inputs.logs_only }}

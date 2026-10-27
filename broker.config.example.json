@@ -1,5 +1,6 @@
 {
   "require_request_id_for_submit": true,
+  "server_qa_workers": 2,
   "source": {
     "full_name": "example-owner/example-source",
     "repository_id": 100001,

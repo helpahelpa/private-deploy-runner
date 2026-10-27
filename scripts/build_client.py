@@ -16,10 +16,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from types import SimpleNamespace
 import build_logs
 import native_apk
+import client_qa
 import zipfile
 
 PRIVATE = Path(__file__).resolve().parents[1]
@@ -230,13 +232,13 @@ def restore_native_payload(entry, destination):
     return dex
 
 
-def container_command(config, mounts, command, writable=None):
+def container_command(config, mounts, command, writable=None, *, qa=False):
     image = config['image']
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
         raise ValueError('Client sandbox image must be pinned by immutable local image ID')
     argv = ['docker', 'run', '--rm', '--pull=never', '--network=none', '--read-only',
             '--user=1000:1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-            '--pids-limit=256', '--memory=4g', '--cpus=4',
+            '--pids-limit=256', '--memory=' + ('2560m' if qa else '4g'), '--cpus=' + ('2' if qa else '4'),
             '--tmpfs=/tmp:rw,nosuid,nodev,size=1g,mode=1777',
             '--tmpfs=/work:rw,nosuid,nodev,size=2g,mode=1777',
             '--tmpfs=/mnt:rw,nosuid,nodev,size=1g,mode=1777',
@@ -261,6 +263,30 @@ def verify_unchanged(pins):
         raise ValueError('Frozen private input changed during build')
 
 
+def qa_identity(tree, fixtures, inputs, vendor, config, compiled):
+    """All admitted source and readable mount bytes, deliberately conservative."""
+    return client_qa.fingerprint({'schema': 1, 'source': tree, 'fixtures': fixtures,
+        'inputs': {name: digest(path) for name, path in inputs.items()},
+        'trusted': client_qa.tree_identity(vendor),
+        'controller': {name: {'sha256': digest(PRIVATE / 'scripts' / name),
+                              'mode': (PRIVATE / 'scripts' / name).stat().st_mode & 0o777} for name in
+                       ('build_client.py', 'client_qa.py', 'build_logs.py', 'native_apk.py')},
+        'toolchains': {tool['target']: client_qa.tree_identity(tool['path'])
+                       for tool in config.get('toolchains', [])},
+        'config_sha256': client_qa.fingerprint(config), 'compiled': compiled})
+
+
+def qa_commands(commands, workers):
+    if type(workers) is not int or not 1 <= workers <= 3:
+        raise ValueError('Client QA workers must be between one and three')
+    if commands == [['python3', '/trusted/regression.py']]:
+        return [commands[0] + ['--shard-index', str(index), '--shard-count', str(workers)]
+                for index in range(workers)]
+    if workers != 1:
+        raise ValueError('Parallel client QA requires the reviewed regression harness')
+    return commands
+
+
 def build(args):
     global DIAGNOSTICS
     match = re.fullmatch(r'4\.2\.0\.([1-9][0-9]*)', args.version)
@@ -270,6 +296,10 @@ def build(args):
     if output.exists():
         raise ValueError('Use a new output directory; release artifacts are immutable')
     config = json.loads(Path(args.config).read_text())
+    force_full_qa = getattr(args, 'force_full_qa', False)
+    if type(force_full_qa) is not bool:
+        raise ValueError('Force full QA requires a boolean')
+    workers = config.get('qa_workers', 1)
     vendor = Path(config.get('trusted_tooling', VENDOR)).resolve()
     if not vendor.is_dir() or vendor.is_symlink():
         raise ValueError('Provision the reviewed private client tooling snapshot')
@@ -282,6 +312,7 @@ def build(args):
     validate_build_mounts(config, inputs, vendor, credential)
     trusted_pins = {str(path): digest(path) for path in vendor.rglob('*') if path.is_file() and '__pycache__' not in path.parts}
     trusted_pins[str(Path(__file__).resolve())] = digest(__file__)
+    trusted_pins[str(Path(client_qa.__file__).resolve())] = digest(client_qa.__file__)
     pins = {str(path): digest(path) for path in inputs.values()}
     if credential is not None:
         pins[str(credential)] = digest(credential)
@@ -337,6 +368,7 @@ def build(args):
         compile_config = dict(config['compile'])
         write_json(root / 'compile.json', compile_config)
         common_mounts = [(vendor, '/trusted'),
+                         (PRIVATE / 'scripts/client_qa.py', '/controller/client_qa.py'),
                          *[(t['path'], t['target']) for t in config.get('toolchains', [])]]
         if reusable:
             build_logs.emit('Material APK inputs are unchanged; reusing the exact signed APK and native payload.')
@@ -363,22 +395,38 @@ def build(args):
         write_json(test_config / 'config.json', compile_config)
         tests = []
         test_output = []
-        for command in commands:
-            build_logs.emit('Android client regression suite started.')
-            result = sandbox_run(container_command(config,
-                [*common_mounts, (source, '/source'), (test_config, '/trusted-test-config')],
-                ['/trusted/test.py', json.dumps(command)]), timeout=config.get('test_timeout', 1200))
-            summary = None
-            for line in result.stdout.splitlines():
-                if line.startswith(b'PRIVATE_CLIENT_TEST_RESULT='):
-                    summary = json.loads(line.split(b'=', 1)[1])
-            tests.append({'command': command, 'result': summary, 'exit_code': result.returncode,
-                          'stdout_sha256': hashlib.sha256(result.stdout).hexdigest(),
-                          'stderr_sha256': hashlib.sha256(result.stderr).hexdigest()})
-            test_output.append(result.stdout + b'\nSTDERR\n' + result.stderr)
-            if result.returncode or not summary or not summary.get('passed'):
-                private_diagnostics(result.stdout, result.stderr)
-                raise ValueError('Exact-commit client sandbox regression failed')
+        partitioned = qa_commands(commands, workers)
+        identity_started = time.monotonic()
+        compiled_identity = {'dex': digest(compile_out / 'classes.dex'), 'managed': digest(compiled_helper)}
+        qa_key = qa_identity(tree, fixture_pins, inputs, vendor, config, compiled_identity)
+        build_logs.emit('Client broad QA input verification completed in ' + str(round(time.monotonic() - identity_started, 3)) + ' seconds.')
+        qa_store = client_qa.Store(config.get('component_cache', str(Path(args.config).resolve().parent / 'client-qa-cache')))
+        cached_qa = client_qa.load_cached(qa_store, qa_key, force_full_qa)
+        required_ids = compile_config.get('required_test_ids', [])
+        minimum_tests = compile_config.get('minimum_client_tests', 1)
+        if cached_qa:
+            build_logs.emit('Client broad QA cache hit; verified prior full-suite results reused; tests are not rerun.')
+            tests, test_output = cached_qa['commands'], [cached_qa['log']]
+            tested_source_commit = cached_qa['tested_source_commit']
+        else:
+            build_logs.emit('Client broad QA cache bypassed; full QA explicitly requested.' if force_full_qa
+                            else 'Client broad QA cache miss; full regression suite started.')
+            def run_partition(command):
+                return sandbox_run(container_command(config,
+                    [*common_mounts, (source, '/source'), (test_config, '/trusted-test-config')],
+                    ['/trusted/test.py', json.dumps(command)], qa=True), timeout=config.get('test_timeout', 1200))
+            results = client_qa.run_parallel(partitioned, workers, run_partition)
+            for command, result in zip(partitioned, results):
+                summary = client_qa.parse_result(result.stdout)
+                tests.append({'command': command, 'result': summary, 'exit_code': result.returncode,
+                              'stdout_sha256': hashlib.sha256(result.stdout).hexdigest(),
+                              'stderr_sha256': hashlib.sha256(result.stderr).hexdigest()})
+                test_output.append(result.stdout + b'\nSTDERR\n' + result.stderr)
+                if result.returncode or not summary or not summary.get('passed'):
+                    private_diagnostics(result.stdout, result.stderr)
+                    raise ValueError('Exact-commit client sandbox regression failed')
+            tested_source_commit = args.commit
+        qa_totals = client_qa.validate_results(tests, required_ids, minimum_tests)
         # Source tests only see read-only source, copied fixtures and toolchain mounts.
         # The signer is loaded only after every test container has exited.
         sys.path[:0] = [str(root / 'launch-build'), str(root / 'server')]
@@ -466,6 +514,8 @@ def build(args):
         source_after = {name: digest(source / name) for name in source_before}
         if source_before != source_after:
             raise ValueError('Frozen sandbox source changed during testing')
+        if qa_identity(tree, fixture_pins, inputs, vendor, config, compiled_identity) != qa_key:
+            raise ValueError('Frozen client QA dependencies changed during build')
         if not reusable:
             with store.locked():
                 existing = store.lookup(apk_key)
@@ -474,6 +524,10 @@ def build(args):
                 elif existing['metadata']['sha256'] != digest(package_args.output):
                     raise ValueError('Concurrent native APK publication differs')
         receipt = {'schema': 1, 'commit': args.commit, 'passed': True, 'source_files': tree,
+                   'qa': dict(qa_totals, input_sha256=qa_key, tested_source_commit=tested_source_commit,
+                              current_source_commit=args.commit, reused=bool(cached_qa),
+                              force_full_qa=force_full_qa, workers=workers,
+                              boundary='entire admitted source, fixtures, trusted harness, configuration, mounted toolchains and compiled payload'),
                    'production_sources': prod, 'fixture_sha256': fixture_pins, 'commands': tests,
                    'verified_apk': {'input_sha256': apk_key, 'source_commit': apk_source_commit,
                                     'sha256': digest(package_args.output), 'version_code': apk_version_code,
@@ -514,6 +568,9 @@ def build(args):
         manifest['asset_files']['apk-update.json'] = digest(artifacts / 'assets/apk-update.json')
         write_json(artifacts / 'manifest.json', manifest)
         artifacts.rename(output)
+        if not cached_qa:
+            with qa_store.locked():
+                qa_store.publish(qa_key, args.commit, tests, b'\n'.join(test_output), required_ids, minimum_tests)
         return manifest
 
 
@@ -521,6 +578,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'source', 'commit', 'output', 'version'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--force-full-qa', action='store_true', help='Run the entire client regression suite even when broad inputs match')
     try:
         result = build(parser.parse_args())
     except (ValueError, KeyError, OSError, subprocess.TimeoutExpired) as error:

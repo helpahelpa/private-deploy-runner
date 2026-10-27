@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/build_client.py'
@@ -16,6 +17,61 @@ spec.loader.exec_module(build)
 
 
 class ClientBoundaryTests(unittest.TestCase):
+    def test_parallel_qa_has_separate_bounded_containers_and_force_flag_is_declared(self):
+        config = {'image': 'sha256:' + '1' * 64}
+        qa = build.container_command(config, [], ['fixture'], qa=True)
+        compile_command = build.container_command(config, [], ['fixture'])
+        self.assertIn('--memory=2560m', qa);self.assertIn('--cpus=2', qa)
+        self.assertIn('--memory=4g', compile_command);self.assertIn('--cpus=4', compile_command)
+        for scratch in ('--tmpfs=/tmp:', '--tmpfs=/work:', '--tmpfs=/mnt:'):
+            self.assertTrue(any(value.startswith(scratch) for value in qa))
+        commands = build.qa_commands([['python3', '/trusted/regression.py']], 3)
+        self.assertEqual(len(commands), 3)
+        self.assertEqual([command[-3] for command in commands], ['0', '1', '2'])
+        for workers in (True, 0, 4):
+            with self.subTest(workers=workers), self.assertRaises(ValueError):
+                build.qa_commands([['python3', '/trusted/regression.py']], workers)
+        with self.assertRaises(ValueError):build.qa_commands([['unreviewed']], 2)
+        arguments = ['build_client.py', '--config', 'fixture', '--source', 'fixture', '--commit', 'a' * 40,
+                     '--output', 'fixture', '--version', '4.2.0.80']
+        for flag in ([], ['--force-full-qa']):
+            with patch.object(sys, 'argv', arguments + flag), patch.object(build, 'build', return_value={}) as run, patch('builtins.print'):
+                build.main()
+                self.assertIs(run.call_args.args[0].force_full_qa, bool(flag))
+
+    def test_broad_qa_identity_covers_source_fixtures_harness_config_and_all_mounted_toolchain_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory);vendor = root / 'vendor';vendor.mkdir();harness = vendor / 'regression.py';harness.write_text('reviewed')
+            tools = root / 'tools';tools.mkdir();runtime = tools / 'unlisted-runtime.dll';runtime.write_bytes(b'runtime1')
+            fixture = root / 'fixture';fixture.write_bytes(b'fixture1')
+            config = {'image': 'sha256:' + '1' * 64, 'toolchains': [{'path': str(tools), 'target': '/toolchain/jdk'}]}
+            source = {'launch-build/test_fixture.py': 'a', 'server/shared.py': 'b', 'README.md': 'c'}
+            def identity(**overrides):
+                values = dict(tree=source, fixtures={'fixture': 'fixture1'}, inputs={'fixture': fixture}, vendor=vendor,
+                              config=config, compiled={'dex': 'one'})
+                values.update(overrides)
+                return build.qa_identity(**values)
+            before = identity()
+            for name in source:
+                changed = dict(source);changed[name] = 'changed';self.assertNotEqual(identity(tree=changed), before)
+            self.assertNotEqual(identity(fixtures={'fixture': 'changed'}), before)
+            self.assertNotEqual(identity(compiled={'dex': 'changed'}), before)
+            changed = dict(config, image='sha256:' + '2' * 64);self.assertNotEqual(identity(config=changed), before)
+            harness.write_text('updated harness');self.assertNotEqual(identity(), before);harness.write_text('reviewed')
+            runtime.write_bytes(b'runtime2');self.assertNotEqual(identity(), before);runtime.write_bytes(b'runtime1')
+            fixture.write_bytes(b'fixture2');self.assertNotEqual(identity(), before)
+
+    def test_qa_harness_change_does_not_change_material_native_apk_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory);vendor = root / 'vendor';vendor.mkdir();harness = vendor / 'regression.py';harness.write_text('qa1')
+            tool = root / 'compiler';tool.write_bytes(b'compiler')
+            names = ('android', 'csc', 'dotnet', 'java', 'javac', 'r8')
+            config = {'image': 'sha256:' + '1' * 64, 'compile': {name: '/toolchain/' + name for name in names}}
+            args = ({'Bridge.java': 'production'}, {'base': tool}, vendor, {name: tool for name in names}, config)
+            before = build.apk_fingerprint(*args)
+            harness.write_text('qa2')
+            self.assertEqual(build.apk_fingerprint(*args), before)
+
     def repository(self, root):
         subprocess.run(['git', 'init', '-q', root], check=True)
         subprocess.run(['git', '-C', root, 'config', 'user.email', 'fixture@example.invalid'], check=True)

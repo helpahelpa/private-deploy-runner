@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Trusted local deployment boundary. Never execute repository commands on the host."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -19,6 +20,7 @@ import time
 import urllib.request
 import uuid
 import build_logs
+import server_qa
 
 BASE = 'python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72'
 PROTOCOL = 'clone-coop-handoff-v1'
@@ -202,8 +204,9 @@ def make_test_certs(destination):
     destination.chmod(0o755)
 
 
-def build_server(source, commit, output, game_data=None, game_text=None, data_compatibility=COMPATIBILITY):
+def build_server(source, commit, output, game_data=None, game_text=None, data_compatibility=COMPATIBILITY,*,component_cache=None,force_full_qa=False,qa_workers=2):
     require(compatible_schema(data_compatibility), 'Invitation-enforcing compatibility policy required')
+    require(type(force_full_qa) is bool and type(qa_workers) is int and 1<=qa_workers<=4,'Invalid server QA policy')
     source, output = Path(source).resolve(), Path(output).absolute()
     verify_source(source, commit)
     require(not output.exists(), 'Build output already exists')
@@ -236,10 +239,34 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
             require(path.is_file() and not path.is_symlink(),'Unsafe test fixture')
             target=fixtures/name;target.parent.mkdir(parents=True,exist_ok=True)
             target.write_bytes(run(['git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-C',str(source),'show',commit+':'+name]))
+        data=None;text=None
+        if game_data:
+            data=Path(game_data).resolve();require(data.is_dir(),'GameData directory missing')
+            if game_text is None and len(data.parents)>2 and (data.parents[2]/'GameText_xored.txt').is_file():game_text=data.parents[2]/'GameText_xored.txt'
+        if game_text:
+            text=Path(game_text).absolute();require(text.is_file() and not text.is_symlink(),'GameText fixture missing')
+        def material():
+            return {'schema':1,'server':source_hashes,'fixtures':tree(fixtures),'game_data':tree(data) if data else None,
+                    'game_text':digest(text) if text else None,'base':BASE,'dockerfile':DOCKERFILE,
+                    'compatibility':data_compatibility,'protocol':PROTOCOL,'workers':qa_workers,
+                    'engine':digest(__file__),'qa_runner':digest(server_qa.__file__),'build_logging':digest(build_logs.__file__),
+                    'host_tools':{name:digest(Path(found).resolve()) if (found:=shutil.which(name)) else None for name in ('docker','openssl')},
+                    'minimum_tests':server_qa.MINIMUM_TESTS}
+        material_inputs=material();cache_key=server_qa.fingerprint(material_inputs)
+        store=server_qa.Store(component_cache) if component_cache else None
+        cached=store.lookup(cache_key) if store and not force_full_qa else None
         (context/'Dockerfile').write_text(DOCKERFILE)
         iid = work/'image-id'
-        run(['docker','build','--network=none','--pull=false','--iidfile',str(iid),'-f',str(context/'Dockerfile'),str(context)], timeout=1800, log=logs/'build.log', public_output=True)
-        image = iid.read_text().strip(); require(IMAGE.fullmatch(image), 'Immutable image ID missing')
+        if cached:
+            image=cached['receipt']['image']
+            run(['docker','image','load','--input',str(cached['path']/'server-image.tar')],timeout=1800,log=logs/'build.log')
+            build_logs.emit('Whole server component cache hit; full suite evidence reused, admission invariants run fresh.')
+            build_logs.emit('Cached server QA: '+str(cached['qa']['tests'])+' passed; zero failures, errors or skips.')
+        else:
+            build_logs.emit('Full server QA requested.' if force_full_qa else 'Server component changed; building and testing the complete server.')
+            run(['docker','build','--network=none','--pull=false','--iidfile',str(iid),'-f',str(context/'Dockerfile'),str(context)], timeout=1800, log=logs/'build.log', public_output=True)
+            image=iid.read_text().strip()
+        require(IMAGE.fullmatch(image),'Immutable image ID missing')
         certs = work/'test-certs'; make_test_certs(certs)
         # Tests need a certificate generator path. Supply a fixed copy adapter,
         # never repository deployment tooling, and only ephemeral fixture keys.
@@ -252,15 +279,28 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
                '--mount',f'type=bind,src={helper_dir},dst=/app/deploy/multiplayer,readonly']
         for name in fixture_names:
             cmd += ['--mount',f'type=bind,src={fixtures/name},dst=/app/{name},readonly']
-        if game_data:
-            data = Path(game_data).resolve(); require(data.is_dir(), 'GameData directory missing')
+        if data:
             cmd += ['--mount',f'type=bind,src={data},dst=/app/work/apk/luapack_extracted/GameData,readonly']
-            if game_text is None and len(data.parents)>2 and (data.parents[2]/'GameText_xored.txt').is_file():game_text=data.parents[2]/'GameText_xored.txt'
-        if game_text:
-            text=Path(game_text).absolute();require(text.is_file() and not text.is_symlink(),'GameText fixture missing')
+        if text:
             cmd += ['--mount',f'type=bind,src={text},dst=/app/work/GameText_xored.txt,readonly']
-        cmd += ['--workdir=/app/server','--entrypoint=python',image,'-m','unittest','discover','-s','.','-p','test_*.py','-v']
-        run_test_container(cmd, work=work, timeout=1800, log=logs/'tests.log')
+        cmd += ['--mount',f'type=bind,src={Path(server_qa.__file__).resolve()},dst=/trusted/server_qa.py,readonly',
+                '--workdir=/app/server','--entrypoint=python',image]
+        if cached:
+            qa=cached['qa'];shutil.copyfile(cached['path']/'tests.log',logs/'tests.log')
+        else:
+            def worker(index):
+                worker_root=work/('qa-worker-'+str(index));worker_root.mkdir()
+                result=run_test_container(cmd+['/trusted/server_qa.py','--worker',str(index),'--workers',str(qa_workers)],
+                                          work=worker_root,timeout=1800,log=logs/('tests-worker-'+str(index)+'.log'))
+                reports=[json.loads(line[len(server_qa.MARKER):]) for line in result.decode().splitlines() if line.startswith(server_qa.MARKER)]
+                require(len(reports)==1,'Missing or ambiguous server QA worker evidence');return reports[0]
+            with ThreadPoolExecutor(max_workers=qa_workers,thread_name_prefix='server-qa') as workers:
+                futures=[workers.submit(worker,index) for index in range(qa_workers)]
+                reports=[future.result() for future in futures]
+            qa=server_qa.aggregate(reports,qa_workers,server_qa.MINIMUM_TESTS)
+            with (logs/'tests.log').open('wb') as combined:
+                for index in range(qa_workers):combined.write((logs/('tests-worker-'+str(index)+'.log')).read_bytes()+b'\n')
+            (logs/'tests.log').chmod(0o600)
         # A trusted invariant suite prevents source tests accidentally omitting
         # invitation admission, durable tokens, and original recovery deadlines.
         invariants = """import tempfile,hashlib,time
@@ -281,19 +321,27 @@ with tempfile.TemporaryDirectory() as t:
  with patch('account_auth.time.time',return_value=time.time()+20*365*86400): assert a.authenticate_token('GateCheck',token,w).guid==guid
  a.close();w.close()
 """
-        run_test_container(cmd[:cmd.index('-m')] + ['-c',invariants], work=work, timeout=60, log=logs/'invariants.log')
+        run_test_container(cmd+['-c',invariants],work=work,timeout=60,log=logs/'invariants.log')
+        build_logs.emit('Fresh server admission invariants passed.')
         verify_source(source, commit)
         require(all(digest(source/name) == value for name,value in source_hashes.items()), 'Source changed while building')
+        require(material()==material_inputs,'Server QA material inputs changed during build')
         artifact = work/'artifact'; artifact.mkdir()
-        run(['docker','image','save','--output',str(artifact/'server-image.tar'),image], timeout=1800)
+        if cached:shutil.copyfile(cached['path']/'server-image.tar',artifact/'server-image.tar')
+        else:run(['docker','image','save','--output',str(artifact/'server-image.tar'),image], timeout=1800)
         for name in ('build.log','tests.log','invariants.log'):
             shutil.copyfile(logs/name,artifact/name); (artifact/name).chmod(0o600)
+        write_json(artifact/'qa.json',qa)
         receipt = {'format':1,'commit':commit,'image':image,'base':BASE,'source_files':source_hashes,
+                   'tested_source_commit':cached['tested_source_commit'] if cached else commit,
+                   'cache_provenance':{'component':'whole server','key':cache_key,'reused':bool(cached),'force_full_qa':force_full_qa},
                    'tests_passed':True,'trusted_invariants_passed':True,'invitation_gate':True,
                    'handoff_compatibility':PROTOCOL,'data_compatibility':data_compatibility,
                    'image_tar_sha256':digest(artifact/'server-image.tar'),
+                   'qa_receipt_sha256':digest(artifact/'qa.json'),
                    'test_log_sha256':digest(artifact/'tests.log'),'invariants_log_sha256':digest(artifact/'invariants.log')}
         write_json(artifact/'server.json',receipt)
+        if store and not cached:store.publish(cache_key,artifact)
         os.replace(artifact,output)
     return {'commit':commit,'image':image,'tests_passed':True}
 

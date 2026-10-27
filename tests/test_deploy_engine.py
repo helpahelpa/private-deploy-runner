@@ -167,6 +167,103 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn('restore(',source)
 
 
+class ServerComponentTests(unittest.TestCase):
+    def setUp(self):
+        BoundaryTests.setUp(self)
+        self.repo=self.root/'source';(self.repo/'server').mkdir(parents=True);(self.repo/'launch-build').mkdir()
+        (self.repo/'server/multiplayer_server.py').write_text('# Synthetic trusted fixture only\n')
+        (self.repo/'server/test_alpha.py').write_text('# Synthetic test fixture\n')
+        (self.repo/'launch-build/fixture.py').write_text('# Mounted fixture\n')
+        (self.repo/'README.md').write_text('first')
+        for args in (['init','--quiet'],['config','user.name','Fixture'],['config','user.email','fixture@example.invalid']):e.run(['git','-C',str(self.repo),*args])
+        self.commit=self.commit_source('first')
+        self.data=self.root/'data';self.data.mkdir();(self.data/'table.json').write_text('{}')
+        self.text=self.root/'text';self.text.write_text('fixture text')
+        self.cache=self.root/'cache';self.calls=[];self.invariants=0;self.builds=0
+        self.barrier=threading.Barrier(2);self.original_run=e.run
+        self.enterContext(patch.object(e.server_qa,'MINIMUM_TESTS',2))
+        self.enterContext(patch.object(e,'run',side_effect=self.command))
+        self.enterContext(patch.object(e,'make_test_certs',side_effect=lambda path:path.mkdir()))
+        self.enterContext(patch.object(e,'run_test_container',side_effect=self.container))
+
+    def commit_source(self,message):
+        e.run(['git','-C',str(self.repo),'add','.']);e.run(['git','-C',str(self.repo),'commit','--quiet','-m',message])
+        return e.git(self.repo,'rev-parse','HEAD')
+
+    def command(self,args,**kwargs):
+        if args[0]!='docker':return self.original_run(args,**kwargs)
+        if args[1]=='build':
+            self.builds+=1;Path(args[args.index('--iidfile')+1]).write_text('sha256:'+'a'*64)
+        elif args[1:3]==['image','save']:Path(args[args.index('--output')+1]).write_bytes(b'synthetic-image')
+        elif args[1:3]!=['image','load']:raise AssertionError('Unexpected Docker fixture command')
+        if kwargs.get('log'):Path(kwargs['log']).write_text('synthetic build log\n')
+        return b''
+
+    def container(self,args,*,work,timeout,log):
+        if '-c' in args:
+            self.invariants+=1;Path(log).write_text('fresh invariant fixture pass\n');return b''
+        self.calls.append((tuple(args),str(work)));self.barrier.wait(3)
+        index=int(args[args.index('--worker')+1]);workers=int(args[args.index('--workers')+1])
+        inventory=['test_alpha.A.test_a','test_beta.B.test_b'];selected=e.server_qa.partition(inventory,workers)[index]
+        report=dict(worker=index,workers=workers,inventory=inventory,selected=selected,executed=selected,
+                    tests=len(selected),passed=True,failures=0,errors=0,skipped=0)
+        output=(e.server_qa.MARKER+json.dumps(report)+'\n').encode();Path(log).write_bytes(output);return output
+
+    def build(self,name,**kwargs):
+        output=self.root/name
+        e.build_server(self.repo,self.commit,output,self.data,self.text,component_cache=self.cache,**kwargs)
+        return json.loads((output/'server.json').read_text())
+
+    def test_whole_component_reuse_rebinds_commit_runs_fresh_invariants_and_force_refreshes(self):
+        first=self.build('first');first_commit=self.commit;first_pointer=next(self.cache.glob('*/current.json')).read_text()
+        self.assertEqual((2,1,1),(len(self.calls),self.invariants,self.builds))
+        self.assertEqual(2,len({work for args,work in self.calls}))
+        for args,work in self.calls:
+            self.assertIn('--network=none',args);self.assertIn('--read-only',args)
+            self.assertTrue(all(value.endswith(',readonly') for value in args if value.startswith('type=bind')))
+        (self.repo/'README.md').write_text('docs-only second commit');self.commit=self.commit_source('docs only')
+        reused=self.build('reused')
+        self.assertEqual((2,2,1),(len(self.calls),self.invariants,self.builds))
+        self.assertEqual(self.commit,reused['commit']);self.assertEqual(first_commit,reused['tested_source_commit'])
+        self.assertTrue(reused['cache_provenance']['reused']);self.assertEqual(first['source_files'],reused['source_files'])
+        forced=self.build('forced',force_full_qa=True)
+        self.assertEqual((4,3,2),(len(self.calls),self.invariants,self.builds))
+        self.assertFalse(forced['cache_provenance']['reused']);self.assertEqual(self.commit,forced['tested_source_commit'])
+        self.assertNotEqual(first_pointer,next(self.cache.glob('*/current.json')).read_text())
+
+    def test_game_data_text_and_mounted_fixture_changes_invalidate_whole_component(self):
+        self.build('first')
+        (self.data/'table.json').write_text('{"changed":true}');self.build('changed-data')
+        self.text.write_text('changed text');self.build('changed-text')
+        (self.repo/'launch-build/fixture.py').write_text('# Changed mounted fixture\n');self.commit=self.commit_source('fixture')
+        self.build('changed-fixture')
+        self.assertEqual((8,4,4),(len(self.calls),self.invariants,self.builds))
+
+    def test_corrupt_cache_fails_closed_and_force_full_qa_publishes_new_immutable_generation(self):
+        info=self.build('first');key=info['cache_provenance']['key']
+        stored=e.server_qa.Store(self.cache).lookup(key);old=stored['path']
+        (old/'server-image.tar').write_bytes(b'tampered')
+        with self.assertRaises(ValueError):self.build('rejected')
+        self.assertEqual(2,len(self.calls))
+        self.build('repaired',force_full_qa=True)
+        self.assertNotEqual(old,e.server_qa.Store(self.cache).lookup(key)['path'])
+        self.assertEqual(b'tampered',(old/'server-image.tar').read_bytes())
+
+    def test_worker_cleanup_failure_cannot_publish_any_component(self):
+        def failed(args,**kwargs):
+            result=self.container(args,**kwargs)
+            if '--worker' in args and args[args.index('--worker')+1]=='0':raise e.DeploymentError('Synthetic worker cleanup failure')
+            return result
+        with patch.object(e,'run_test_container',side_effect=failed),self.assertRaises(e.DeploymentError):self.build('failed')
+        self.assertEqual(2,len(self.calls));self.assertEqual(0,self.invariants)
+        self.assertFalse((self.root/'failed').exists());self.assertEqual([],list(self.cache.glob('*/current.json')))
+
+    def test_cached_suite_does_not_bypass_failed_fresh_admission_invariants(self):
+        self.build('first')
+        with patch.object(e,'run_test_container',side_effect=e.DeploymentError('Synthetic invariant failure')),self.assertRaises(e.DeploymentError):self.build('rejected')
+        self.assertEqual(2,len(self.calls));self.assertFalse((self.root/'rejected').exists())
+
+
 class SameCommitPromotionTests(unittest.TestCase):
     def setUp(self):
         BoundaryTests.setUp(self)

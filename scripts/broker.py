@@ -103,6 +103,7 @@ def config_read(path):
             and isinstance(b, str) and SHA.fullmatch(b) for a, b in aliases.items()))
     require(type(value.get("publish_apk", True)) is bool)
     require(type(value.get('require_request_id_for_submit',False)) is bool)
+    require(type(value.get('server_qa_workers',2)) is int and 1 <= value.get('server_qa_workers',2) <= 4)
     require(type(value.get("control_private", True)) is bool)
     if value.get("static_assets"):
         base = value["static_assets"]
@@ -336,13 +337,14 @@ class Operations:
         require(files == value["files"])
         return cache
 
-    def build(self, sha, version, stage, *, request_id=None):
+    def build(self, sha, version, stage, *, request_id=None, force_full_qa=False):
         with public_logging(self.c, job_key(sha, request_id)):
-            return self._build(sha, version, stage, request_id=request_id)
+            return self._build(sha, version, stage, request_id=request_id, force_full_qa=force_full_qa)
 
-    def _build(self, sha, version, stage, *, request_id=None):
+    def _build(self, sha, version, stage, *, request_id=None, force_full_qa=False):
+        require(type(force_full_qa) is bool)
         key = job_key(sha, request_id)
-        cached = self.cached(sha) if request_id is None else None
+        cached = self.cached(sha) if request_id is None and not force_full_qa else None
         if cached:
             build_logs.emit("Reusing verified cached artifacts; recorded test results follow. Tests are not being rerun.")
             self.replay_logs(cached)
@@ -362,11 +364,13 @@ class Operations:
             stage("server")
             policy=json.loads(Path(self.c['engine_config']).read_text())['data_compatibility']
             server = workers.submit(engine.build_server, source, sha, scratch / "server", self.c.get("game_data"),
-                                    data_compatibility=policy)
+                                    data_compatibility=policy, component_cache=self.root / 'components' / 'server',
+                                    force_full_qa=force_full_qa, qa_workers=self.c.get('server_qa_workers',2))
             stage("client")
             client_build = workers.submit(self.command,
                 [sys.executable, PRIVATE / "scripts/build_client.py", "--config", self.c["client_config"],
-                 "--source", source, "--commit", sha, "--output", scratch / "client", "--version", "4.2.0." + str(version)], timeout=3000)
+                 "--source", source, "--commit", sha, "--output", scratch / "client", "--version", "4.2.0." + str(version),
+                 *(['--force-full-qa'] if force_full_qa else [])], timeout=3000)
             transport_check = None
             if self.c.get("transport_config"):
                 stage("transport")
@@ -538,6 +542,7 @@ class Broker:
             sha,request_id=job_identity(path.stem)
             job = self.load(sha,request_id)
             require(job["sha"] == sha and job.get('request_id')==request_id and job["status"] in ("queued", "running", "success", "failed"))
+            require(type(job.get('force_full_qa',False)) is bool)
             if job["status"] == "running":
                 if request_id is not None or job["stage"] in ("promote", "verify"):
                     try:
@@ -564,6 +569,7 @@ class Broker:
             result['phase']=phase
             result['request_id']=job['request_id']
             result['replacement_verified']=job.get('replacement_verified',False)
+            result['force_full_qa']=job.get('force_full_qa',False)
         return result
 
     def handle(self, request):
@@ -571,12 +577,16 @@ class Broker:
         operation = request.get("op")
         expected = {"op", "sha", "token", "cursor"} if operation == "logs" else {"op", "sha", "token"}
         if 'request_id' in request:expected.add('request_id')
+        if 'force_full_qa' in request:
+            require(operation=='submit' and 'request_id' in request and type(request['force_full_qa']) is bool)
+            expected.add('force_full_qa')
         require(set(request) == expected)
         require(isinstance(request["token"], str) and hmac.compare_digest(request["token"], self.token))
         require(operation in ("submit", "status", "logs"))
         if operation == "logs":
             require(type(request["cursor"]) is int and 0 <= request["cursor"] < (1 << 63))
         request_id=request.get('request_id')
+        force_full_qa=request.get('force_full_qa',False)
         if 'request_id' in request:require(isinstance(request_id,str) and REQUEST_ID.fullmatch(request_id))
         require(operation!='submit' or not self.c.get('require_request_id_for_submit',False) or request_id is not None)
         sha = request["sha"]
@@ -591,6 +601,8 @@ class Broker:
                 elif operation=='submit':watch.save_state(binding,{'sha':sha,'request_id':request_id})
                 else:require(False)
             job = self.load(sha,request_id)
+            if operation=='submit' and job is not None:
+                require(job.get('force_full_qa',False)==force_full_qa)
             if request_id is None and operation != "logs" and job is not None and job["status"] == "success":
                 # A historical receipt is not proof that the release is active
                 # now, including after an operator rollback or later deployment.
@@ -610,7 +622,9 @@ class Broker:
                 require(version <= 2147483647)
                 watch.save_state(counter, {"last": version})
                 job = {"sha": sha, "status": "queued", "stage": "queued", "version": version}
-                if request_id is not None:job['request_id']=request_id
+                if request_id is not None:
+                    job['request_id']=request_id
+                    job['force_full_qa']=force_full_qa
                 self.save(job)
                 self.pending.put(key)
             require(job is not None)
@@ -659,8 +673,9 @@ class Broker:
             self.operations.preflight()
             job = self.load(sha,request_id)
             build_args=(sha,job['version'],lambda stage:self.stage(key,stage))
-            release = (self.operations.build(*build_args,request_id=request_id) if request_id is not None
-                       else self.operations.build(*build_args))
+            build_options={'request_id':request_id} if request_id is not None else {}
+            if job.get('force_full_qa',False):build_options['force_full_qa']=True
+            release = self.operations.build(*build_args,**build_options)
             require(self.operations.current() == sha)
             self.stage(key, "promote")
             if request_id is not None:
