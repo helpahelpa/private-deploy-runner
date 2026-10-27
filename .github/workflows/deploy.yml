@@ -1,4 +1,5 @@
-name: Private deployment
+# Manual dispatch only; external pull requests do not run on this runner.
+name: Main deployment
 run-name: ${{ inputs.logs_only && 'logs' || 'deploy' }}-${{ inputs.source_sha }}
 
 on:
