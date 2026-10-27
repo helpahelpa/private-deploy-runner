@@ -396,16 +396,26 @@ class BrokerTests(unittest.TestCase):
             (output / "assets/update_config.json").write_text("new")
             (output / "client.apk").write_bytes(b"signed-fixture")
             broker.engine.write_json(output / "client-tests.json", {"commit": A, "passed": True})
-            broker.engine.write_json(output / "manifest.json", {"commit": A,
-                "asset_files": broker.engine.tree(output / "assets"),
+            manifest = {"commit": A, "package": "example.privateworld",
+                "apk_version_code": 68, "apk_version_name": "4.2.0.68",
+                "apk_input_sha256": "1" * 64, "apk_source_commit": B, "apk_reused": True,
+                "signing_certificate_sha256": "f" * 64,
                 "client_tests_sha256": broker.engine.digest(output / "client-tests.json"),
-                "apk_sha256": broker.engine.digest(output / "client.apk")})
+                "apk_sha256": broker.engine.digest(output / "client.apk")}
+            broker.engine.write_json(output / "assets/apk-update.json",
+                                     broker.native_apk.update_metadata(manifest, output / "client.apk"))
+            manifest["asset_files"] = broker.engine.tree(output / "assets")
+            broker.engine.write_json(output / "manifest.json", manifest)
         def assemble(server, assets, provenance, receipt, output):
             value = json.loads(provenance.read_text())
             self.assertEqual(value["files"], broker.engine.tree(assets))
             self.assertEqual((assets / "update_config.json").read_text(), "new")
             self.assertEqual((assets / "base.bin").read_text(), "original static asset")
             self.assertEqual((assets / "client.apk").read_bytes(), b"signed-fixture")
+            metadata = json.loads((assets / "apk-update.json").read_text())
+            self.assertEqual(metadata["version_code"], 68)
+            self.assertEqual(metadata["sha256"], broker.engine.digest(assets / "client.apk"))
+            self.assertEqual(metadata["url"], "/client.apk")
             assembled.append(value)
             output.mkdir()
             (output / "manifest.json").write_text("fixture")
@@ -416,6 +426,22 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(release, operations.cached(A) / "release")
         receipt = json.loads((release.parent / "receipt.json").read_text())
         self.assertIn("transport/transport.json", receipt["files"])
+
+    def test_public_apk_metadata_cannot_advertise_a_different_signed_artifact(self):
+        client = self.root / 'metadata-client'
+        (client / 'assets').mkdir(parents=True)
+        (client / 'client.apk').write_bytes(b'signed fixture')
+        manifest = {'package': 'example.privateworld', 'apk_version_code': 68,
+            'apk_version_name': '4.2.0.68', 'signing_certificate_sha256': 'f' * 64,
+            'apk_input_sha256': '1' * 64, 'apk_source_commit': A, 'apk_reused': False}
+        metadata = broker.native_apk.update_metadata(manifest, client / 'client.apk')
+        broker.engine.write_json(client / 'assets/apk-update.json', metadata)
+        broker.verify_apk_update(client, manifest)
+        for change in ({'version_code': 69}, {'sha256': '2' * 64}, {'package': 'example.other'},
+                       {'signing_cert_sha256': '0' * 64}, {'url': 'https://other.example/client.apk'}):
+            broker.engine.write_json(client / 'assets/apk-update.json', dict(metadata, **change))
+            with self.subTest(change=change), self.assertRaises(broker.BrokerError):
+                broker.verify_apk_update(client, manifest)
 
     def test_fixed_builds_overlap_and_failed_client_waits_for_server_completion(self):
         config = dict(self.config, client_config=self.root / "client-config.json")

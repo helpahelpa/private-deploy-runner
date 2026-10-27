@@ -179,6 +179,14 @@ the tested client assets, and publishes the signed APK as `assets/client.apk`
 when `publish_apk` is true. It recreates provenance for the complete merged tree
 before assembly. Immutable build receipts bind every cached file to its SHA.
 
+The signed APK is content-addressed separately from the incremental asset release.
+Server-only, documentation, test or asset-release changes keep the exact APK bytes
+and Android version; all exact-commit QA still runs. Material native inputs reserve
+a new durable Android version only on a signed-APK cache miss. The public
+`/apk-update.json` describes the real signed artifact and certificate without host
+settings. See [client build configuration](docs/client-build.md) for cache migration,
+version seeding and provenance.
+
 Version allocations begin at `minimum_version` (at least 62), increase durably,
 and are never recycled after a failed build. The example reserves 62 for operator
 bootstrap and starts automated builds at 63. The engine must already have an

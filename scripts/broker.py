@@ -23,6 +23,7 @@ import traceback
 import deploy_engine as engine
 import check_transport as transport
 import build_logs
+import native_apk
 import watch_master as watch
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -104,6 +105,20 @@ def config_read(path):
                 and isinstance(item["path"], str) and Path(item["path"]).is_absolute()
                 and isinstance(item["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]))
     return value
+
+
+def verify_apk_update(client, manifest):
+    # Older sealed releases predate native-content reuse. New builder output
+    # binds public update metadata to the actual APK, independent asset release.
+    if 'apk_input_sha256' not in manifest:
+        return
+    require(isinstance(manifest.get('apk_input_sha256'), str)
+            and re.fullmatch(r'[0-9a-f]{64}', manifest['apk_input_sha256'])
+            and isinstance(manifest.get('apk_source_commit'), str)
+            and SHA.fullmatch(manifest['apk_source_commit']) and type(manifest.get('apk_reused')) is bool)
+    expected = native_apk.update_metadata(manifest, client / 'client.apk')
+    actual = json.loads((client / 'assets/apk-update.json').read_text())
+    require(actual == expected)
 
 
 class Operations:
@@ -351,6 +366,7 @@ class Operations:
                 and engine.digest(receipt) == manifest["client_tests_sha256"]
                 and engine.tree(client / "assets") == manifest["asset_files"]
                 and engine.digest(client / "client.apk") == manifest["apk_sha256"])
+        verify_apk_update(client, manifest)
         stage("assemble")
         assets = scratch / "assets"
         base = self.c.get("static_assets")

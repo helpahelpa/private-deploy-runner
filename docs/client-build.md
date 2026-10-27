@@ -8,10 +8,18 @@ python3 scripts/build_client.py --config local/client-build.private.json \
   --output local/releases/<new-release> --version 4.2.0.<allocated-counter>
 ```
 
-The operator reserves a globally monotonic counter under the deployment lock; the builder requires a new output directory and a version of at least 62. APK files are published atomically with `manifest.json` and `client-tests.json`. No deployment, ADB, save, preferences, or network write happens here. Assets contain the new incremental pack, update configuration and server list; the deployment layer supplies the retained static asset base.
+The operator reserves a globally monotonic **incremental asset** counter under the deployment lock; the builder requires a new output directory and a version of at least 62. APK files are published atomically with `manifest.json` and `client-tests.json`. No deployment, ADB, save, preferences, or network write happens here. Assets contain the new incremental pack, update configuration and server list; the deployment layer supplies the retained static asset base.
+
+The Android package version is independent of that asset counter. A private content-addressed store reuses the exact signed APK whenever production Java/C#, relevant trusted packaging/compiler code, pinned native inputs, trust/signing identity and endpoint configuration are unchanged. Source commits, server/docs/test changes and incremental asset version allocations do not cause another APK or native version. Every requested commit still runs the complete isolated client QA suite and produces its own honest receipt and current incremental assets.
+
+`manifest.json` records `apk_input_sha256`, the original `apk_source_commit`, actual `apk_version_code`/`apk_version_name`, and whether the APK was reused. The independent native counter is persisted before signing and failed reservations are never recycled. Retain the private store and counter when moving hosts; deleting them can defeat version continuity. An owner must seed the minimum strictly above all previously installed/published Android version codes when creating a replacement store.
+
+The client assets include `/apk-update.json`, with schema, package, actual Android version code/name, exact APK SHA256/size, signer certificate SHA256 and the same-origin `/client.apk` URL. These fields come from the signed artifact report; they contain no credentials or host paths. Incremental server release versions continue advancing independently.
 
 The private JSON configuration has these fields:
 
+- `apk_cache`: optional absolute private directory for sealed signed APKs and their durable native version counter; defaults to `signed-apk-cache` beside the private build configuration. Keep it outside source/test mounts.
+- `minimum_native_version_code`: optional first native Android version allocation (positive Int32). The allocator also exceeds the recovered base APK and every prior reservation. This is separate from the broker's `minimum_version` for incremental assets.
 - `image`: an existing immutable Docker image ID, `sha256:…`. The image needs compatible Linux Python, OpenSSL, cryptography, dnfile, dncil and Pillow. The retained AST checks use a provisioned PowerShell toolchain; its parser and pure helper assertions execute inside the same restrictions. Build/test never pulls images or installs packages.
 - `toolchains`: read-only `path` and `target` objects. Allowed targets are `/toolchain/jdk`, `/toolchain/dotnet`, `/toolchain/android`, and `/toolchain/pwsh`. Supply dedicated toolchain directories containing no secrets.
 - `python_dependencies`: the container path for baked Python packages (defaults to `/python-deps`).

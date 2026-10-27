@@ -3,10 +3,12 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/build_client.py'
+sys.path.insert(0, str(SCRIPT.parent))
 spec = importlib.util.spec_from_file_location('private_build_client', SCRIPT)
 build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
