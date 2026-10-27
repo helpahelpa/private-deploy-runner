@@ -103,6 +103,51 @@ def checked_input(value):
     return path.resolve()
 
 
+def apk_download_credentials(config):
+    """Pin the private packaging-only credential without decoding its contents."""
+    value = config.get('apk_download_credentials')
+    if value is None:
+        return None
+    path = checked_input(value)
+    if path.stat().st_mode & 0o077:
+        raise ValueError('APK download credential requires private file permissions')
+    return path
+
+
+def validate_build_mounts(config, inputs, vendor, credential):
+    protected = [inputs[name] for name in ('key', 'cert')]
+    if credential is not None:
+        protected.append(credential)
+        if credential.is_relative_to(vendor):
+            raise ValueError('APK download credential must stay outside trusted tooling mounts')
+    for tool in config.get('toolchains', []):
+        if set(tool) != {'path', 'target'} or tool['target'] not in ('/toolchain/jdk', '/toolchain/dotnet', '/toolchain/android', '/toolchain/pwsh'):
+            raise ValueError('Only explicit, read-only toolchain mounts are permitted')
+        toolpath = Path(tool['path']).resolve()
+        if not toolpath.is_dir() or any(path.is_relative_to(toolpath) for path in protected):
+            raise ValueError('Toolchain mounts must exclude private packaging identity')
+
+
+def validate_fixture_identity(original, key, credential):
+    protected = {digest(path) for path in (key, credential) if path is not None}
+    if digest(original) in protected:
+        raise ValueError('Private packaging credentials must never enter test fixtures')
+
+
+def verify_download_credential_payload(apk, credential, serializer):
+    """Check the deliberate payload only in the post-test trusted packaging phase."""
+    if credential is None:
+        return
+    expected = serializer(json.loads(credential.read_text()))
+    with zipfile.ZipFile(apk) as packaged:
+        try:
+            actual = packaged.read('assets/privateworld/apk-download.properties')
+        except KeyError:
+            raise ValueError('Signed APK download authorization payload missing') from None
+    if actual != expected:
+        raise ValueError('Signed APK download authorization payload mismatch')
+
+
 def snapshot(source, commit, destination, lfs_object_store=None):
     """Read Git blobs directly; no archive symlinks, hooks, filters or submodules."""
     if not COMMIT.fullmatch(commit):
@@ -165,7 +210,11 @@ def apk_fingerprint(production, inputs, vendor, tools, config):
                for path in vendor.rglob('*') if path.is_file() and '__pycache__' not in path.parts
                and (path.parent.name in ('launch-build', 'server') or path.name in ('compile.py', 'csc.py'))}
     compiler_names = ('android', 'csc', 'dotnet', 'java', 'javac', 'r8')
-    return native_apk.fingerprint(production, {name: digest(path) for name, path in inputs.items()},
+    material_inputs = {name: digest(path) for name, path in inputs.items()}
+    credential = apk_download_credentials(config)
+    if credential is not None:
+        material_inputs['apk_download_credentials'] = digest(credential)
+    return native_apk.fingerprint(production, material_inputs,
         tooling, {name: digest(path) for name, path in tools.items() if name in compiler_names},
         {name: config['compile'][name] for name in compiler_names if name in config['compile']},
         config.get('connection'), config['image'])
@@ -229,19 +278,17 @@ def build(args):
                 'helper', 'helper_manifest', 'android_receipt', 'mscorlib.dll', 'UnityEngine.dll', 'System.dll', 'LitJson.dll'}
     if not required <= inputs.keys():
         raise ValueError('Required private compilation/signing inputs are missing')
+    credential = apk_download_credentials(config)
+    validate_build_mounts(config, inputs, vendor, credential)
     trusted_pins = {str(path): digest(path) for path in vendor.rglob('*') if path.is_file() and '__pycache__' not in path.parts}
     trusted_pins[str(Path(__file__).resolve())] = digest(__file__)
     pins = {str(path): digest(path) for path in inputs.values()}
+    if credential is not None:
+        pins[str(credential)] = digest(credential)
     pins.update(trusted_pins)
     tool_pins = {name: checked_input(value) for name, value in config.get('toolchain_files', {}).items()}
     pins.update({str(path): digest(path) for path in tool_pins.values()})
-    # Signing identity and endpoint configs are never part of test/compile mounts.
-    for tool in config.get('toolchains', []):
-        if set(tool) != {'path', 'target'} or tool['target'] not in ('/toolchain/jdk', '/toolchain/dotnet', '/toolchain/android', '/toolchain/pwsh'):
-            raise ValueError('Only explicit, read-only toolchain mounts are permitted')
-        toolpath = Path(tool['path']).resolve()
-        if not toolpath.is_dir() or any(p.is_relative_to(toolpath) for n, p in inputs.items() if n in ('key', 'cert')):
-            raise ValueError('Toolchain mounts must exclude signing identity')
+    # Packaging identity and endpoint configs never enter test/compile mounts.
     commands = config.get('test_commands')
     if not isinstance(commands, list) or not commands or any(not isinstance(c, list) or not c or
             any(not isinstance(a, str) or '\x00' in a for a in c) for c in commands):
@@ -278,8 +325,7 @@ def build(args):
             if path.is_absolute() or '..' in path.parts or '\\' in name or name in tree:
                 raise ValueError('Fixture must be a new relative source path')
             original = checked_input(value)
-            if digest(original) == digest(inputs['key']):
-                raise ValueError('Signing keys must never enter test fixtures')
+            validate_fixture_identity(original, inputs['key'], credential)
             target = source / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(original, target)
@@ -385,6 +431,7 @@ def build(args):
                 base_apk=inputs['base_apk'], client_source=inputs['client_source'], ca=inputs['ca'],
                 expected_ca_sha256=digest(inputs['ca']), toolchain=inputs['android_receipt'],
                 coop_runtime=compiled_helper, connection_config=connection_path if config.get('connection') else None,
+                apk_download_credentials=credential,
                 require_existing_signing_identity=False,
                 reuse_apk=reusable['path'] if reusable else None,
                 reuse_apk_report=reusable['build_report'] if reusable else None)
@@ -395,6 +442,8 @@ def build(args):
                 actual_version = manifest_tool.manifest_version(packaged.read('AndroidManifest.xml'))
             if actual_version != (apk_version_code, apk_version_name):
                 raise ValueError('Signed APK Android version differs from its build metadata')
+            if credential is not None:
+                verify_download_credential_payload(package_args.output, credential, builder.download_credentials)
             if reusable:
                 if digest(package_args.output) != reusable['metadata']['sha256']:
                     raise ValueError('Reused signed APK bytes changed during asset preparation')

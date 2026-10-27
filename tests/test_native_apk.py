@@ -159,6 +159,22 @@ class MaterialInputTests(unittest.TestCase):
         self.config['compile']['csc'] = '/tools/next-compiler'
         self.assertNotEqual(self.key(), original)
 
+    def test_download_credential_rotation_rebuilds_but_relocation_keeps_material_key(self):
+        absent = self.key()
+        credential = self.root / 'download.json'
+        credential.write_text(json.dumps({'username': 'user', 'password': 'fixture-download-password'}))
+        credential.chmod(0o600)
+        self.config['apk_download_credentials'] = {'path': str(credential), 'sha256': build_client.digest(credential)}
+        first = self.key()
+        self.assertNotEqual(absent, first)
+        relocated = self.root / 'relocated.json'
+        relocated.write_bytes(credential.read_bytes());relocated.chmod(0o600)
+        self.config['apk_download_credentials']['path'] = str(relocated)
+        self.assertEqual(first, self.key())
+        relocated.write_text(json.dumps({'username': 'user', 'password': 'rotated-fixture-download-password'}))
+        self.config['apk_download_credentials']['sha256'] = build_client.digest(relocated)
+        self.assertNotEqual(first, self.key())
+
 
 if __name__ == '__main__':
     unittest.main()
