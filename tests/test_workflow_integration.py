@@ -83,6 +83,9 @@ class GatedOperations:
             self.master = OTHER
         return self.config["local_root"] / "releases" / request_id
 
+    def assets_can_publish(self, release):
+        return False
+
     def release_is_active(self, release):
         return False
 

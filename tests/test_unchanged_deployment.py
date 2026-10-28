@@ -26,6 +26,8 @@ class FakeOperations:
         self.master = B
         self.active = A
         self.builds, self.promotions, self.publications, self.verifications = [], [], [], []
+        self.asset_publications = []
+        self.assets = False
         self.finalized = []
         self.unchanged = True
 
@@ -38,6 +40,20 @@ class FakeOperations:
     def build(self, sha, version, stage, *, request_id=None, force_full_qa=False):
         self.builds.append(sha)
         return Path('/private/release')
+
+    def assets_can_publish(self, release):
+        return self.assets
+
+    def publish_assets(self, sha, release):
+        self.asset_publications.append(sha)
+        return {'id': uuid.uuid4().hex, 'phase': 'assets', 'restarted': False, 'to': sha,
+                'from': self.active, 'container': 'c' * 64, 'image': IMAGE,
+                'assets_sha256': 'd' * 64, 'assets_release': sha,
+                'release_path': str(release), 'previous_release_path': '/private/older'}
+
+    def verify_assets_publication(self, sha, release, proof):
+        self.verifications.append(('assets', proof['restarted']))
+        return proof['restarted'] is False
 
     def release_is_active(self, release):
         return self.unchanged
@@ -99,6 +115,17 @@ class BrokerPublicationTests(unittest.TestCase):
         self.assertIs(False, job['server_restarted'])
         self.assertEqual([('unchanged', False)], self.ops.verifications)
 
+    def test_changed_assets_are_published_without_restarting(self):
+        self.ops.unchanged = False
+        self.ops.assets = True
+        job = self.run_job()
+        self.assertEqual('success', job['status'])
+        self.assertEqual([], self.ops.promotions)
+        self.assertEqual([B], self.ops.asset_publications)
+        self.assertIs(False, job['server_restarted'])
+        self.assertEqual('assets', job['publication'])
+        self.assertEqual([('assets', False)], self.ops.verifications)
+
     def test_changed_artifact_still_uses_the_handoff(self):
         self.ops.unchanged = False
         job = self.run_job()
@@ -147,6 +174,93 @@ class ClientMaterialTests(unittest.TestCase):
     def test_missing_published_apk_publishes_a_new_version(self):
         (self.active / 'client.apk').unlink()
         self.assertFalse(self.unchanged())
+
+
+class AssetsPublicationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'deployments').mkdir()
+        self.runtime = object.__new__(e.Engine)
+        self.runtime.c = {'health_timeout_seconds': 5}
+        self.runtime.root = self.root
+        self.old = self.release('old', '4.2.0.76', b'old-pack')
+        self.new = self.release('new', '4.2.0.99', b'new-pack')
+        self.manifest = {'commit': B, 'image': IMAGE}
+        self.active = {'release': A, 'tracked': A, 'assets_release': A, 'image': IMAGE,
+                       'container': 'c' * 64, 'release_path': str(self.old),
+                       'assets_sha256': e.assets_digest(self.old)}
+
+    def release(self, name, version, payload):
+        base = self.root / name
+        pack = base / 'assets/Android_90/UpdateRoot/IncrementPack' / version / 'Client/GameRes/Resources'
+        pack.mkdir(parents=True)
+        (pack / 'Client.bytes.bytes').write_bytes(payload)
+        (base / 'assets/update_config.json').write_text(json.dumps({'server_versions': {'Android_90': version}}))
+        return base
+
+    def patched(self, *, reload=True, mount=None):
+        @contextlib.contextmanager
+        def lock(*_args, **_kwargs):
+            yield
+        return [patch.object(self.runtime, 'lock', lock),
+                patch.object(self.runtime, 'verify',
+                             lambda p: (Path(p), dict(self.manifest, commit=Path(p).name == 'new' and B or A))),
+                patch.object(self.runtime, 'active', lambda: self.active),
+                patch.object(self.runtime, 'healthy', lambda *a, **k: {}),
+                patch.object(self.runtime, 'check_desired', lambda commit: None),
+                patch.object(self.runtime, 'control', lambda *a, **k: {'assets_reload': reload}),
+                patch.object(self.runtime, 'container_assets_source',
+                             lambda cid, deadline=None: self.runtime.served_assets if mount is None else mount),
+                patch.object(self.runtime, 'inspect',
+                             lambda cid, timeout=None: {'State': {'Running': True}, 'Image': IMAGE})]
+
+    def publish(self, **options):
+        for item in self.patched(**options):
+            item.start()
+            self.addCleanup(item.stop)
+        return self.runtime.publish_assets(str(self.new), A)
+
+    def test_changed_assets_are_published_in_place(self):
+        event = self.publish()
+        self.assertEqual(('assets', False), (event['phase'], event['restarted']))
+        self.assertEqual(e.assets_digest(self.new), event['assets_sha256'])
+        served = self.runtime.served_assets
+        self.assertTrue((served / 'Android_90/UpdateRoot/IncrementPack/4.2.0.99/Client/GameRes/Resources/Client.bytes.bytes').is_file())
+        self.assertTrue((served / 'update_config.json').is_file())
+        active = json.loads((self.root / 'active.json').read_text())
+        self.assertEqual((B, B, A), (active['tracked'], active['assets_release'], active['release']))
+        self.assertEqual(event, json.loads((self.root / 'deployments' / (event['id'] + '.json')).read_text()))
+
+    def test_previous_release_files_are_retained_and_older_ones_pruned(self):
+        served = self.runtime.served_assets
+        self.runtime.sync_assets(str(self.old))
+        stale = served / 'Android_90/UpdateRoot/IncrementPack/4.2.0.50/Client/GameRes/Resources/Client.bytes.bytes'
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b'stale')
+        self.publish()
+        self.assertFalse(stale.parent.parent.parent.parent.exists())
+        self.assertTrue((served / 'Android_90/UpdateRoot/IncrementPack/4.2.0.76/Client/GameRes/Resources/Client.bytes.bytes').is_file())
+        self.assertTrue((served / 'Android_90/UpdateRoot/IncrementPack/4.2.0.99/Client/GameRes/Resources/Client.bytes.bytes').is_file())
+
+    def test_world_without_reload_support_requires_a_handoff(self):
+        with self.assertRaisesRegex(e.DeploymentError, 'cannot reload'):
+            self.publish(reload=False)
+
+    def test_world_serving_a_release_directory_requires_a_handoff(self):
+        with self.assertRaisesRegex(e.DeploymentError, 'serves a release directory'):
+            self.publish(mount=self.old / 'assets')
+
+    def test_identical_assets_require_no_publication(self):
+        self.active = dict(self.active, assets_sha256=e.assets_digest(self.new))
+        with self.assertRaisesRegex(e.DeploymentError, 'identical assets|Identical assets'):
+            self.publish()
+
+    def test_changed_server_image_requires_a_handoff(self):
+        self.manifest = dict(self.manifest, image='sha256:' + '2' * 64)
+        with self.assertRaisesRegex(e.DeploymentError, 'requires a handoff'):
+            self.publish()
 
 
 class EnginePublicationTests(unittest.TestCase):

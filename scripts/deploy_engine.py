@@ -557,13 +557,50 @@ class Engine:
         result=json.loads(reply);require(result.get('ok') is True and isinstance(result.get('data'),dict),'Authenticated control rejected')
         return result['data']
 
+    @property
+    def served_assets(self):
+        return self.root/'served'/'assets'
+
+    def sync_assets(self,release,retain=()):
+        """Publish a release's assets onto the stable served mount, atomically per file.
+
+        Configuration files are replaced last so a client never sees a version
+        whose payload is only half published. Only the current release and the
+        explicitly retained previous one keep their files."""
+        served=self.served_assets;source=Path(release)/'assets'
+        wanted=tree(source)
+        served.mkdir(parents=True,exist_ok=True)
+        ordered=sorted(wanted,key=lambda name:(name.endswith('update_config.json') or name.endswith('apk-update.json'),name))
+        for name in ordered:
+            target=served/name;target.parent.mkdir(parents=True,exist_ok=True)
+            if target.is_file() and digest(target)==wanted[name]:continue
+            temporary=target.with_name('.pending-'+target.name)
+            temporary.write_bytes((source/name).read_bytes())
+            os.replace(temporary,target)
+        keep=set(wanted)
+        for previous in retain:
+            keep.update(tree(Path(previous)/'assets'))
+        for path in sorted(served.rglob('*'),reverse=True):
+            name=path.relative_to(served).as_posix()
+            if path.is_file() and name not in keep:path.unlink()
+            elif path.is_dir() and not any(path.iterdir()):path.rmdir()
+        require(tree(served) and all(digest(served/name)==wanted[name] for name in wanted),
+                'Served asset publication is incomplete')
+        return assets_digest(release)
+
+    def assets_reload_supported(self):
+        try:
+            return self.control({'op':'status'}).get('assets_reload') is True
+        except (DeploymentError,OSError,ValueError):
+            return False
+
     def mounts(self,release,admin_enabled=None):
         c=self.c
         for key in ('game_data','certificates','control'):
             require(c[key].is_dir() and not c[key].is_symlink(),'Required runtime directory missing')
         mounts=[('volume',c['data_volume'],'/data',False),('bind',str(c['control']),'/control',False),
                 ('bind',str(c['game_data']),'/app/work/apk/luapack_extracted/GameData',True),
-                ('bind',str(Path(release)/'assets'),'/assets',True)]
+                ('bind',str(self.served_assets),'/assets',True)]
         for name in ('server.crt','server.key','ca.crt'):
             p=c['certificates']/name;require(p.is_file() and not p.is_symlink(),'TLS identity missing')
             mounts.append(('bind',str(p),'/certs/'+name,True))
@@ -581,21 +618,27 @@ class Engine:
         require('TZ=Asia/Tokyo' in cfg.get('Env',[]),'World timezone mismatch')
         require(cfg.get('User')=='1000:1000' and host.get('RestartPolicy',{}).get('Name') in ('no',''),'Unsafe world user/restart policy')
         require(not host.get('Devices') and not host.get('DeviceRequests') and host.get('PidMode','')!='host' and host.get('IpcMode','')!='host','Host resources exposed')
-        expected={(kind,str(source),target,ro) for kind,source,target,ro in self.mounts(release,enabled)}
-        # Docker Desktop rewrites WSL bind sources to a deterministic broker
-        # path. Match its exact distro label + SHA256(original source), never a
-        # broad path-prefix exception.
+        # Assets are served from the stable mount. A world started before that
+        # mount existed still serves its own release directory; both are exact.
+        variants=[]
+        for source in (self.served_assets,Path(release)/'assets'):
+            variant={(kind,str(path),target,ro) for kind,path,target,ro in self.mounts(release,enabled) if target!='/assets'}
+            variant.add(('bind',str(source),'/assets',True))
+            variants.append(variant)
         distro=cfg.get('Labels',{}).get('desktop.docker.io/wsl-distro','')
-        translations={}
-        if re.fullmatch(r'[A-Za-z0-9_.-]+',distro):
-            for kind,source,target,ro in expected:
-                if kind=='bind':
-                    broker='/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/'+distro+'/'+hashlib.sha256(source.encode()).hexdigest()
-                    translations[broker]=source
-        actual={(m['Type'],m.get('Name') if m['Type']=='volume' else translations.get(m['Source'],m['Source']),m['Destination'],not m['RW']) for m in data['Mounts']}
-        # Docker reports tmpfs separately on different daemon versions.
-        actual={m for m in actual if m[0]!='tmpfs'}
-        require(actual==expected,'Unexpected runtime mount binding')
+        expected=set()
+        for variant in variants:
+            translated=set()
+            for kind,source,target,ro in variant:
+                if kind=='bind' and re.fullmatch(r'[A-Za-z0-9_.-]+',distro):
+                    # Docker Desktop rewrites WSL bind sources to a deterministic
+                    # broker path; match its exact distro label + SHA256(source).
+                    translated.add((kind,'/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/'+distro+'/'+hashlib.sha256(source.encode()).hexdigest(),target,ro))
+                else:
+                    translated.add((kind,source,target,ro))
+            expected.add(frozenset(variant));expected.add(frozenset(translated))
+        actual=frozenset((m['Type'],m.get('Name') if m['Type']=='volume' else m['Source'],m['Destination'],not m['RW']) for m in data['Mounts'] if m['Type']!='tmpfs')
+        require(actual in expected,'Unexpected runtime mount binding')
         ports=host.get('PortBindings') or {}
         require(not ports,'World ports must be exposed only by trusted ingress')
         networks=data.get('NetworkSettings',{}).get('Networks',{})
@@ -606,6 +649,19 @@ class Engine:
         require('--deployment-release='+manifest['commit'] in command and '--deployment-control=/control/socket' in command and
                 '--deployment-secret=/control/secret' in command,'World deployment identity flags missing')
         return data
+
+    def container_assets_source(self,cid,deadline=None):
+        """The directory the running world serves /assets from."""
+        data=self.inspect(cid,timeout=max(.05,min(3,deadline-time.monotonic())) if deadline else 30)
+        distro=data['Config'].get('Labels',{}).get('desktop.docker.io/wsl-distro','')
+        for mount in data['Mounts']:
+            if mount['Destination']!='/assets':continue
+            source=Path(mount['Source'])
+            if re.fullmatch(r'[A-Za-z0-9_.-]+',distro) and str(source).startswith('/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/'):
+                # Only the stable mount can be identified from a rewritten path.
+                source=self.served_assets if source.name==hashlib.sha256(str(self.served_assets).encode()).hexdigest() else source
+            return source
+        raise DeploymentError('Missing asset mount')
 
     def healthy(self,cid,release,manifest,deadline):
         last=None
@@ -621,7 +677,8 @@ class Engine:
                 connection=http.client.HTTPSConnection('localhost',self.c['https_port'],context=context,timeout=max(.05,min(2,deadline-time.monotonic())))
                 try:
                     connection.request('GET','/healthz');response=connection.getresponse();require(response.status==200,'HTTPS health rejected');response.read(65536)
-                    connection.request('GET','/update_config.json');response=connection.getresponse();require(response.status==200 and hashlib.sha256(response.read()).hexdigest()==digest(Path(release)/'assets/update_config.json'),'Served asset identity mismatch')
+                    served=self.container_assets_source(cid,deadline)
+                    connection.request('GET','/update_config.json');response=connection.getresponse();require(response.status==200 and hashlib.sha256(response.read()).hexdigest()==digest(served/'update_config.json'),'Served asset identity mismatch')
                 finally:connection.close()
                 require(time.monotonic()<deadline,'World health exceeded deadline')
                 return status
@@ -697,6 +754,7 @@ class Engine:
         return cid
 
     def start(self,release,manifest,handoff='',deadline=None,*,admin_enabled=None):
+        self.sync_assets(release)
         if not deadline:self.ensure_network();self.ensure_ingress()
         c=self.c;enabled=self.admin.enabled() if admin_enabled is None else admin_enabled
         require(type(enabled) is bool and (not enabled or self.admin.config is not None),'Invalid admin runtime selection')
@@ -778,7 +836,8 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                     timeout=max(.1,deadline-time.monotonic()))
 
     def record_active(self,cid,release,manifest):
-        value={'release':manifest['commit'],'tracked':manifest['commit'],'image':manifest['image'],'container':cid,'release_path':str(release),
+        value={'release':manifest['commit'],'tracked':manifest['commit'],'assets_release':manifest['commit'],
+               'image':manifest['image'],'container':cid,'release_path':str(release),
                'ingress':self.ingress_id(),'assets_sha256':hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()}
         value.update(self.admin.record(cid))
         write_json(self.root/'active.json',value)
@@ -811,6 +870,36 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             if self.c.get('runtime_registry'):
                 write_json(self.c['runtime_registry'], updated)
             build_logs.emit('Deployment: server image and assets unchanged; the active world was left running.')
+            return event
+
+    def publish_assets(self, release, expected_tracked):
+        """Publish a release's assets onto the running world without restarting it."""
+        with self.lock(wait_seconds=20):
+            path,new=self.verify(release);active=self.active()
+            require(SHA.fullmatch(expected_tracked or '') and self.tracked(active)==expected_tracked,
+                    'Stale asset publication')
+            self.check_desired(new['commit'])
+            require(new['image']==active['image'],'Changed server image requires a handoff')
+            assets=assets_digest(path)
+            require(assets!=active.get('assets_sha256'),'Identical assets require no publication')
+            old_path,old=self.verify(active['release_path'])
+            require(self.assets_reload_supported(),'Running world cannot reload published assets')
+            require(self.container_assets_source(active['container'])==self.served_assets,
+                    'Running world serves a release directory; a handoff is required')
+            self.healthy(active['container'],old_path,old,time.monotonic()+self.c.get('health_timeout_seconds',15))
+            build_logs.emit('Deployment: publishing assets onto the running world.')
+            self.sync_assets(path,retain=[old_path])
+            self.healthy(active['container'],old_path,old,time.monotonic()+self.c.get('health_timeout_seconds',15))
+            deployment=uuid.uuid4().hex
+            event={'id':deployment,'from':old['commit'],'to':new['commit'],'phase':'assets','restarted':False,
+                   'rollback':False,'container':active['container'],'image':active['image'],
+                   'assets_sha256':assets,'assets_release':new['commit'],
+                   'previous_release_path':str(old_path),'release_path':str(path)}
+            write_json(self.root/'deployments'/(deployment+'.json'),event)
+            updated=dict(active,tracked=new['commit'],assets_release=new['commit'],assets_sha256=assets)
+            write_json(self.root/'active.json',updated)
+            if self.c.get('runtime_registry'):write_json(self.c['runtime_registry'],updated)
+            build_logs.emit('Deployment: assets published; the running world was not restarted.')
             return event
 
     def check_desired(self,commit):

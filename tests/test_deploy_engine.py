@@ -353,7 +353,7 @@ class DesktopRecoveryTests(unittest.TestCase):
         self.expected_mounts=[('volume','test-data','/data',False),
                               ('bind',str(self.root/'control'),'/control',False),
                               ('bind',str(self.root/'game'),'/app/work/apk/luapack_extracted/GameData',True),
-                              ('bind',str(self.release/'assets'),'/assets',True)]
+                              ('bind',str(self.engine.served_assets),'/assets',True)]
         self.expected_mounts += [('bind',str(self.root/'certs'/name),'/certs/'+name,True)
                                  for name in ('server.crt','server.key','ca.crt')]
         self.set_mounts(translated=True)

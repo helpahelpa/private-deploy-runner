@@ -68,6 +68,9 @@ class AttemptOperations(FakeOperations):
         release=super().build(sha,version,stage)
         return release/str(request_id)
 
+    def assets_can_publish(self, release):
+        return False
+
     def release_is_active(self, release):
         return False
 

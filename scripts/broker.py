@@ -535,6 +535,45 @@ class Operations:
                 and engine.assets_digest(path) == active['assets_sha256']
                 and str(path) != active['release_path'])
 
+    def assets_can_publish(self, release):
+        """True when only the served assets change and the running world reloads them."""
+        runtime = engine.Engine(self.c["engine_config"])
+        active = runtime.active()
+        path, manifest = runtime.verify(release)
+        return (manifest['image'] == active['image']
+                and engine.assets_digest(path) != active.get('assets_sha256')
+                and runtime.assets_reload_supported())
+
+    def publish_assets(self, sha, release):
+        """Publish a changed client without restarting the running world."""
+        runtime = engine.Engine(self.c["engine_config"])
+        active = runtime.active()
+        authority = runtime.c.get("desired_commit_file")
+        require(authority is not None and Path(authority).is_absolute())
+        require(self.current() == sha)
+        watch.save_desired(authority, sha)
+        return runtime.publish_assets(release, runtime.tracked(active))
+
+    def verify_assets_publication(self, sha, release, proof):
+        require(isinstance(proof, dict) and re.fullmatch(r'[0-9a-f]{32}', proof.get('id', ''))
+                and proof.get('phase') == 'assets' and proof.get('restarted') is False
+                and proof.get('to') == sha and proof.get('rollback') is False
+                and proof.get('release_path') == str(Path(release).resolve())
+                and proof.get('assets_sha256') == engine.assets_digest(release)
+                and re.fullmatch(r'[0-9a-f]{64}', proof.get('container', ''))
+                and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', proof.get('image', '')))
+        runtime = engine.Engine(self.c['engine_config'])
+        require(json.loads((runtime.root / 'deployments' / (proof['id'] + '.json')).read_text()) == proof)
+        require(runtime.status()['managed_release'] == sha)
+        active = runtime.active()
+        require(active['container'] == proof['container'] and active.get('tracked') == sha
+                and active['release'] == proof['from'] and active['image'] == proof['image']
+                and active.get('assets_release') == sha
+                and active.get('assets_sha256') == proof['assets_sha256'])
+        require(runtime.inspect(proof['container'])['State']['Running'] is True)
+        require(engine.tree(runtime.served_assets).keys() >= engine.tree(Path(release) / 'assets').keys())
+        return True
+
     def publish_unchanged(self, sha, release):
         """Adopt the commit without touching the running world."""
         runtime = engine.Engine(self.c["engine_config"])
@@ -758,23 +797,28 @@ class Broker:
             require(self.operations.current() == sha)
             self.stage(key, "promote")
             restarted=True
+            published='unchanged'
             if request_id is not None:
-                # A release that changes neither the server image nor the assets
-                # is adopted without stopping the world.
+                # A release that changes neither the server image nor the assets is
+                # adopted in place; changed assets alone are published onto the
+                # running world when it can reload them. Only a new image restarts it.
                 if self.operations.release_is_active(release):
                     proof=self.operations.publish_unchanged(sha,release);restarted=False
+                elif self.operations.assets_can_publish(release):
+                    proof=self.operations.publish_assets(sha,release);restarted=False;published='assets'
                 else:
                     proof=self.operations.promote(sha,release,replace_same_commit=True)
                 with self.mutex:
                     job=self.load(sha,request_id);job.update(release_path=str(Path(release).resolve()),
-                        promotion=proof,server_restarted=restarted);self.save(job)
+                        promotion=proof,server_restarted=restarted,publication=published);self.save(job)
             else:self.operations.promote(sha, release)
             self.stage(key, "verify")
             self.operations.finalize(sha)
             require(self.operations.status() == sha)
             if request_id is not None:
-                require((self.operations.verify_publication(sha,release,proof) if not restarted
-                         else self.operations.verify_replacement(sha,release,proof)) is True)
+                if restarted:require(self.operations.verify_replacement(sha,release,proof) is True)
+                elif published=='assets':require(self.operations.verify_assets_publication(sha,release,proof) is True)
+                else:require(self.operations.verify_publication(sha,release,proof) is True)
             with self.mutex:
                 job = self.load(sha,request_id)
                 require(job['status']=='running')
