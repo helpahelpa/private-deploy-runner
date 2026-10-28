@@ -110,6 +110,18 @@ def tree(path):
     return result
 
 
+def server_identity(release):
+    """Content identity of a release's server build, independent of its image build id.
+
+    Two rebuilds of identical sources get different image IDs because the image
+    configuration carries a creation timestamp; deployment decisions use this
+    content identity instead."""
+    info=json.loads((Path(release)/'server.json').read_text())
+    source=info.get('source_files')
+    require(isinstance(source,dict) and source and isinstance(info.get('base'),str),'Invalid server receipt')
+    return hashlib.sha256(json.dumps({'base':info['base'],'source':source},sort_keys=True).encode()).hexdigest()
+
+
 def assets_digest(release):
     """Digest of the assets a release would serve."""
     return hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()
@@ -841,7 +853,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
 
     def record_active(self,cid,release,manifest):
         value={'release':manifest['commit'],'tracked':manifest['commit'],'assets_release':manifest['commit'],
-               'assets_release_path':str(release),
+               'assets_release_path':str(release),'server_identity':server_identity(release),
                'image':manifest['image'],'container':cid,'release_path':str(release),
                'ingress':self.ingress_id(),'assets_sha256':hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()}
         value.update(self.admin.record(cid))
@@ -857,8 +869,8 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             require(SHA.fullmatch(expected_tracked or '') and self.tracked(active) == expected_tracked,
                     'Stale unchanged publication')
             assets = assets_digest(path)
-            require(new['image'] == active['image'] and assets == active['assets_sha256'],
-                    'Release changes the server image or assets; a handoff is required')
+            require(self.same_server(path,active) and assets == active['assets_sha256'],
+                    'Release changes the server build or assets; a handoff is required')
             old_path, old = self.verify(active['release_path'])
             self.healthy(active['container'], old_path, old, time.monotonic() + self.c.get('health_timeout_seconds', 15))
             current = self.inspect(active['container'])
@@ -878,6 +890,18 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             build_logs.emit('Deployment: server image and assets unchanged; the active world was left running.')
             return event
 
+    def same_server(self, release, active):
+        """True when the release runs the same server content as the active world."""
+        try:
+            return server_identity(release) == server_identity(active['release_path'])
+        except (OSError, ValueError, KeyError, DeploymentError):
+            pass
+        try:
+            image = json.loads((Path(release)/'manifest.json').read_text()).get('image')
+        except (OSError, ValueError):
+            return False
+        return image is not None and image == active.get('image')
+
     def publish_assets(self, release, expected_tracked):
         """Publish a release's assets onto the running world without restarting it."""
         with self.lock(wait_seconds=20):
@@ -885,7 +909,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             require(SHA.fullmatch(expected_tracked or '') and self.tracked(active)==expected_tracked,
                     'Stale asset publication')
             self.check_desired(new['commit'])
-            require(new['image']==active['image'],'Changed server image requires a handoff')
+            require(self.same_server(path,active),'Changed server build requires a handoff')
             assets=assets_digest(path)
             require(assets!=active.get('assets_sha256'),'Identical assets require no publication')
             old_path,old=self.verify(active['release_path'])

@@ -182,6 +182,45 @@ class ClientMaterialTests(unittest.TestCase):
         self.assertFalse(self.unchanged())
 
 
+class ServerContentIdentityTests(unittest.TestCase):
+    """A rebuild of identical server sources must not look like a new server."""
+
+    def release(self, root, name, image, source):
+        base = Path(root) / name
+        base.mkdir(parents=True)
+        (base / 'server.json').write_text(json.dumps({'commit': name, 'image': image,
+                                                      'base': 'python@sha256:' + '1' * 64,
+                                                      'source_files': source}))
+        return base
+
+    def test_rebuilt_image_with_identical_sources_is_the_same_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = object.__new__(e.Engine)
+            source = {'server/multiplayer_server.py': 'a' * 64}
+            active_release = self.release(directory, 'old', 'sha256:' + '1' * 64, source)
+            new_release = self.release(directory, 'new', 'sha256:' + '2' * 64, source)
+            self.assertEqual(e.server_identity(active_release), e.server_identity(new_release))
+            self.assertTrue(runtime.same_server(new_release, {'release_path': str(active_release)}))
+
+    def test_changed_sources_are_a_new_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = object.__new__(e.Engine)
+            active_release = self.release(directory, 'old', 'sha256:' + '1' * 64,
+                                          {'server/multiplayer_server.py': 'a' * 64})
+            new_release = self.release(directory, 'new', 'sha256:' + '1' * 64,
+                                       {'server/multiplayer_server.py': 'b' * 64})
+            self.assertFalse(runtime.same_server(new_release, {'release_path': str(active_release)}))
+
+    def test_missing_receipts_fall_back_to_the_image_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = object.__new__(e.Engine)
+            bare = Path(directory) / 'bare'
+            bare.mkdir()
+            (bare / 'manifest.json').write_text(json.dumps({'image': 'sha256:' + '3' * 64}))
+            self.assertTrue(runtime.same_server(bare, {'release_path': str(bare), 'image': 'sha256:' + '3' * 64}))
+            self.assertFalse(runtime.same_server(bare, {'release_path': str(bare), 'image': 'sha256:' + '4' * 64}))
+
+
 class AssetsPublicationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -204,6 +243,8 @@ class AssetsPublicationTests(unittest.TestCase):
         pack.mkdir(parents=True)
         (pack / 'Client.bytes.bytes').write_bytes(payload)
         (base / 'assets/update_config.json').write_text(json.dumps({'server_versions': {'Android_90': version}}))
+        (base / 'server.json').write_text(json.dumps({'image': IMAGE, 'base': 'python@sha256:' + '1' * 64,
+                                                     'source_files': {'server/x.py': 'a' * 64}}))
         return base
 
     def patched(self, *, reload=True, mount=None):
@@ -266,6 +307,9 @@ class AssetsPublicationTests(unittest.TestCase):
 
     def test_changed_server_image_requires_a_handoff(self):
         self.manifest = dict(self.manifest, image='sha256:' + '2' * 64)
+        (self.new / 'server.json').write_text(json.dumps({'image': 'sha256:' + '2' * 64,
+                                                         'base': 'python@sha256:' + '1' * 64,
+                                                         'source_files': {'server/x.py': 'b' * 64}}))
         with self.assertRaisesRegex(e.DeploymentError, 'requires a handoff'):
             self.publish()
 
@@ -281,10 +325,16 @@ class EnginePublicationTests(unittest.TestCase):
         self.runtime.root = self.root
         self.release = self.root / 'release'
         (self.release / 'assets').mkdir(parents=True)
+        (self.release / 'server.json').write_text(json.dumps({'image': IMAGE, 'base': 'python@sha256:' + '1' * 64,
+                                                             'source_files': {'server/x.py': 'a' * 64}}))
         (self.release / 'assets' / 'update_config.json').write_text('{"server_version": "4.2.0.1"}')
         self.manifest = {'commit': B, 'image': IMAGE}
+        old = self.root / 'old'
+        old.mkdir()
+        (old / 'server.json').write_text(json.dumps({'image': IMAGE, 'base': 'python@sha256:' + '1' * 64,
+                                                    'source_files': {'server/x.py': 'a' * 64}}))
         self.active = {'release': A, 'tracked': A, 'image': IMAGE, 'container': 'c' * 64,
-                       'release_path': str(self.root / 'old'),
+                       'release_path': str(old),
                        'assets_sha256': e.assets_digest(self.release)}
 
     def patched(self, inspect_image=IMAGE):
@@ -306,6 +356,14 @@ class EnginePublicationTests(unittest.TestCase):
 
     def test_identical_image_and_assets_are_adopted_and_recorded(self):
         event = self.publish()
+
+    def test_rebuilt_server_with_identical_sources_is_adopted_without_a_restart(self):
+        # A rebuild of identical sources yields a new image id; content identity wins.
+        self.manifest = dict(self.manifest, image='sha256:' + '9' * 64)
+        (self.release / 'server.json').write_text(json.dumps({
+            'image': 'sha256:' + '9' * 64, 'base': 'python@sha256:' + '1' * 64,
+            'source_files': {'server/x.py': 'a' * 64}}))
+        event = self.publish()
         self.assertEqual(('unchanged', False), (event['phase'], event['restarted']))
         self.assertEqual(str(self.release), event['release_path'])
         self.assertEqual(event, json.loads((self.root / 'deployments' / (event['id'] + '.json')).read_text()))
@@ -318,8 +376,11 @@ class EnginePublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(e.DeploymentError, 'handoff is required'):
             self.publish()
 
-    def test_changed_server_image_requires_a_handoff(self):
-        self.manifest = dict(self.manifest, image='2' * 64)
+    def test_changed_server_content_requires_a_handoff(self):
+        self.manifest = dict(self.manifest, image='sha256:' + '2' * 64)
+        (self.release / 'server.json').write_text(json.dumps({'image': 'sha256:' + '2' * 64,
+                                                             'base': 'python@sha256:' + '1' * 64,
+                                                             'source_files': {'server/x.py': 'b' * 64}}))
         with self.assertRaisesRegex(e.DeploymentError, 'handoff is required'):
             self.publish()
 

@@ -538,7 +538,7 @@ class Operations:
         runtime = engine.Engine(self.c["engine_config"])
         active = runtime.active()
         path, manifest = runtime.verify(release)
-        return (manifest['image'] == active['image']
+        return (runtime.same_server(path, active)
                 and engine.assets_digest(path) == active['assets_sha256']
                 and str(path) != active['release_path'])
 
@@ -547,7 +547,7 @@ class Operations:
         runtime = engine.Engine(self.c["engine_config"])
         active = runtime.active()
         path, manifest = runtime.verify(release)
-        return (manifest['image'] == active['image']
+        return (runtime.same_server(path, active)
                 and engine.assets_digest(path) != active.get('assets_sha256')
                 and runtime.assets_reload_supported())
 
