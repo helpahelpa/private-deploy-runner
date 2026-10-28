@@ -357,7 +357,7 @@ private-cache, and collaborator-call assertions from 44 otherwise useful server
 tests. A follow-up independent Sol/Opus review removed three proven duplicates
 and refined weak assertions while retaining the important scenarios. The retained
 deployment suites contain 219 client, 740 server, 59 Python
-transport, 23 Worker, and 239 controller tests. The separate 11-case portable
+transport, 23 Worker, and 242 controller tests. The separate 11-case portable
 release suite is retained. Test baselines reflect this explicit curation;
 zero-skip source QA, complete worker coverage, account/session admission and live
 replacement verification remain required.

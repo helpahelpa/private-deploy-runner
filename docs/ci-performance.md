@@ -57,6 +57,30 @@ and fresh test counts. Cache corruption, missing/duplicate IDs, changed discover
 failed tests or failed cleanup fail the build. Evidence is published only after
 frozen-input checks; later packaging/deployment failures still fail the workflow.
 
+## Intermediate artifacts and fixture staging
+
+The reviewed private packager's multiplayer and cooperative PE transforms have
+separate sealed output entries. Keys cover actual input bytes, packaging Python,
+parser library trees and the host Python runtime. Outputs are checksum-verified
+before reuse. These transforms are pure: if one acquires another runtime package
+or external input, extend `build_artifacts.patch_policy` before caching it.
+Only the reviewed private tooling executes on the host; game Python/tests remain
+inside restricted containers. Transform caches are never mounted into source QA.
+
+The signed native cache continues restoring its exact compiled DEX/managed payload.
+Release paths, incremental manifests, update configuration and publication hashes
+are regenerated for the allocated asset version. Every request still checks the
+APK version, signature metadata, credential payload and prohibited content.
+Force full QA bypasses test evidence while allowing unchanged build artifacts.
+
+Fixed private QA fixtures are provisioned as checksum-addressed, mode-0444 files
+in an ignored local store. The controller verifies declared pins and staged bytes,
+links immutable fixtures into the read-only source snapshot when possible, and
+checks frozen input/source hashes after QA and packaging. Mutable fixtures or
+cross-filesystem destinations use verified copies with the same staged mode.
+This avoids repeated large copies without dropping the input checks. Original
+historical fixture files, live clients and player data are not modified.
+
 ## Scheduling and measurements
 
 Client modules stay intact so expensive class/module fixtures run once. A bounded

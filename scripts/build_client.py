@@ -6,6 +6,7 @@ Only regular Java/C# blobs are admitted to compilation. Config is operator-owned
 """
 import argparse
 import datetime
+import errno
 import hashlib
 import importlib
 import json
@@ -25,6 +26,7 @@ import client_qa
 import component_inputs
 import git_source
 import qa_tasks
+import build_artifacts
 import zipfile
 
 PRIVATE = Path(__file__).resolve().parents[1]
@@ -133,9 +135,9 @@ def validate_build_mounts(config, inputs, vendor, credential):
             raise ValueError('Toolchain mounts must exclude private packaging identity')
 
 
-def validate_fixture_identity(original, key, credential):
+def validate_fixture_identity(original, key, credential, *, verified_sha256=None):
     protected = {digest(path) for path in (key, credential) if path is not None}
-    if digest(original) in protected:
+    if (verified_sha256 if verified_sha256 is not None else digest(original)) in protected:
         raise ValueError('Private packaging credentials must never enter test fixtures')
 
 
@@ -283,7 +285,7 @@ def qa_material(tree, fixtures, inputs, vendor, config, compiled):
         'trusted': client_qa.tree_identity(vendor),
         'controller': {name: {'sha256': digest(PRIVATE / 'scripts' / name),
                               'mode': (PRIVATE / 'scripts' / name).stat().st_mode & 0o777} for name in
-                       ('build_client.py', 'client_qa.py', 'client-qa-weights.json', 'qa_tasks.py', 'component_inputs.py',
+                       ('build_client.py', 'client_qa.py', 'client-qa-weights.json', 'qa_tasks.py', 'build_artifacts.py', 'component_inputs.py',
                         'git_source.py', 'build_logs.py', 'native_apk.py')},
         'toolchains': {tool['target']: client_qa.tree_identity(tool['path'])
                        for tool in config.get('toolchains', [])},
@@ -332,7 +334,7 @@ def build(args):
     validate_build_mounts(config, inputs, vendor, credential)
     trusted_pins = {str(path): digest(path) for path in vendor.rglob('*') if path.is_file() and '__pycache__' not in path.parts}
     for path in (Path(__file__),Path(client_qa.__file__),Path(component_inputs.__file__),
-                 Path(git_source.__file__),Path(qa_tasks.__file__),client_qa.WEIGHTS):
+                 Path(git_source.__file__),Path(qa_tasks.__file__),Path(build_artifacts.__file__),client_qa.WEIGHTS):
         trusted_pins[str(path.resolve())] = digest(path)
     pins = {str(path): digest(path) for path in inputs.values()}
     if credential is not None:
@@ -374,18 +376,35 @@ def build(args):
             shutil.copyfile(inputs[name], root / 'work/apk/managed' / name)
         shutil.copyfile(inputs['template'], root / 'work/apk/md5_4201.bin')
         # Copy allowlisted fixtures. No external directory mount reaches test code.
+        fixture_started = time.monotonic()
         fixture_pins = {}
         for name, value in config.get('fixtures', {}).items():
             path = PurePosixPath(name)
             if path.is_absolute() or '..' in path.parts or '\\' in name or name in tree:
                 raise ValueError('Fixture must be a new relative source path')
             original = checked_input(value)
-            validate_fixture_identity(original, inputs['key'], credential)
             target = source / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(original, target)
-            fixture_pins[name] = digest(original)
+            fixture_store = Path(config.get('fixture_store', PRIVATE / 'local/build-fixtures')).resolve()
+            linked = False
+            if (fixture_store.is_relative_to(PRIVATE / 'local') and original.is_relative_to(fixture_store)
+                    and original.stat().st_mode & 0o777 == 0o444):
+                try:
+                    os.link(original, target)
+                    linked = True
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+            if not linked:
+                shutil.copyfile(original, target)
+                target.chmod(0o444)
+            fixture_pins[name] = digest(target)
+            if fixture_pins[name] != value['sha256']:
+                raise ValueError('Frozen fixture copy differs from its approved input')
+            validate_fixture_identity(target, inputs['key'], credential, verified_sha256=fixture_pins[name])
             pins[str(original)] = fixture_pins[name]
+        build_logs.emit('Client verified fixture staging: ' + str(len(fixture_pins)) + ' files in '
+                        + str(round(time.monotonic() - fixture_started, 3)) + ' seconds.')
         compile_out = stage / 'compiled'
         compile_out.mkdir(mode=0o777)
         compile_out.chmod(0o777)
@@ -547,6 +566,28 @@ def build(args):
         builder.ROOT = root
         builder.LOCAL = stage / 'artifacts'
         builder.LOCAL.mkdir()
+        # Pure binary transforms have their own material cache. Release-specific
+        # wrappers, manifests, checksums, endpoint properties and signing stay in
+        # the reviewed packager and are regenerated/verified for every request.
+        patch_modules = {name: importlib.import_module(module) for name, module in
+                         (('multiplayer', 'patch_multiplayer_client'), ('cooperative', 'patch_clone_coop'))}
+        patch_policy, patch_pins = build_artifacts.patch_policy(root)
+        pins.update(patch_pins)
+        patch_store = build_artifacts.Store(config.get('artifact_cache',
+            str(Path(args.config).resolve().parent / 'client-build-artifacts')))
+        artifact_receipts = {}
+        for name, module in patch_modules.items():
+            if not Path(module.__file__).resolve().is_relative_to(root):
+                raise ValueError('Only reviewed private transforms may run on the host')
+            original = module.patch_pe
+            def transform(raw, name=name, original=original):
+                result, evidence = patch_store.transform(name, patch_policy, raw, original,
+                    verify=lambda: verify_unchanged(patch_pins))
+                artifact_receipts[name] = evidence
+                build_logs.emit('Client binary transform ' + name + ': '
+                    + ('cache hit; verified output reused.' if evidence['reused'] else 'computed and cached.'))
+                return result
+            module.patch_pe = transform
         from cryptography import x509
         from cryptography.hazmat.primitives import serialization
         cert = x509.load_pem_x509_certificate(inputs['cert'].read_bytes())
@@ -677,6 +718,7 @@ def build(args):
                     'classes2_dex_sha256': build_report['classes2_dex_sha256'],
                     'signing_certificate_sha256': build_report['signing_certificate_sha256'],
                     'runtime_sha256': digest(compiled_helper), 'established_helper_preserved': same_helper,
+                    'build_artifacts': artifact_receipts,
                     'connection_properties_sha256': hashlib.sha256(connection).hexdigest()}
         update_manifest = native_apk.update_metadata(manifest, artifacts / 'client.apk')
         write_json(artifacts / 'assets/apk-update.json', update_manifest)
