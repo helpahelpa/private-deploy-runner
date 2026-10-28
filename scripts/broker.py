@@ -355,9 +355,12 @@ class Operations:
         for name in versioned:
             parts = PurePosixPath(name).parts
             marker = parts.index('IncrementPack')
+            # A release keeps the static base pack beside the client pack, so any
+            # matching payload proves the served version is already current.
             pattern = '/'.join(parts[:marker + 1]) + '/*/' + '/'.join(parts[marker + 2:])
-            peers = [path for path in sorted(active_assets.glob(pattern)) if path.is_file()]
-            if not peers or engine.digest(peers[0]) != engine.digest(client / 'assets' / name):
+            wanted = engine.digest(client / 'assets' / name)
+            if not any(password.is_file() and engine.digest(password) == wanted
+                       for password in active_assets.glob(pattern)):
                 return False
         return True
 

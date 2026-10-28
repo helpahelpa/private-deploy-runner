@@ -163,6 +163,12 @@ class ClientMaterialTests(unittest.TestCase):
     def test_identical_client_payload_reuses_the_published_version(self):
         self.assertTrue(self.unchanged())
 
+    def test_static_base_pack_beside_the_client_pack_does_not_force_a_new_version(self):
+        base = self.active / (self.pack % '4.2.0.60')
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_bytes(b'static-base-pack')
+        self.assertTrue(self.unchanged())
+
     def test_changed_pack_payload_publishes_a_new_version(self):
         (self.client / 'assets' / (self.pack % '4.2.0.99')).write_bytes(b'changed')
         self.assertFalse(self.unchanged())
