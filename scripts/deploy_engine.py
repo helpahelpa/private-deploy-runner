@@ -650,16 +650,20 @@ class Engine:
                 '--deployment-secret=/control/secret' in command,'World deployment identity flags missing')
         return data
 
-    def container_assets_source(self,cid,deadline=None):
-        """The directory the running world serves /assets from."""
+    def container_assets_source(self,cid,release=None,deadline=None):
+        """The host directory the running world serves /assets from."""
         data=self.inspect(cid,timeout=max(.05,min(3,deadline-time.monotonic())) if deadline else 30)
         distro=data['Config'].get('Labels',{}).get('desktop.docker.io/wsl-distro','')
+        candidates=[self.served_assets]+([Path(release)/'assets'] if release is not None else [])
         for mount in data['Mounts']:
             if mount['Destination']!='/assets':continue
             source=Path(mount['Source'])
-            if re.fullmatch(r'[A-Za-z0-9_.-]+',distro) and str(source).startswith('/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/'):
-                # Only the stable mount can be identified from a rewritten path.
-                source=self.served_assets if source.name==hashlib.sha256(str(self.served_assets).encode()).hexdigest() else source
+            for candidate in candidates:
+                if source==candidate:return candidate
+                # Docker Desktop rewrites the bind source to SHA256(host path).
+                if re.fullmatch(r'[A-Za-z0-9_.-]+',distro) and source.name==hashlib.sha256(str(candidate).encode()).hexdigest():
+                    return candidate
+            require(source.is_dir(),'Asset mount source is unavailable')
             return source
         raise DeploymentError('Missing asset mount')
 
@@ -677,7 +681,7 @@ class Engine:
                 connection=http.client.HTTPSConnection('localhost',self.c['https_port'],context=context,timeout=max(.05,min(2,deadline-time.monotonic())))
                 try:
                     connection.request('GET','/healthz');response=connection.getresponse();require(response.status==200,'HTTPS health rejected');response.read(65536)
-                    served=self.container_assets_source(cid,deadline)
+                    served=self.container_assets_source(cid,release,deadline)
                     connection.request('GET','/update_config.json');response=connection.getresponse();require(response.status==200 and hashlib.sha256(response.read()).hexdigest()==digest(served/'update_config.json'),'Served asset identity mismatch')
                 finally:connection.close()
                 require(time.monotonic()<deadline,'World health exceeded deadline')
@@ -884,7 +888,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             require(assets!=active.get('assets_sha256'),'Identical assets require no publication')
             old_path,old=self.verify(active['release_path'])
             require(self.assets_reload_supported(),'Running world cannot reload published assets')
-            require(self.container_assets_source(active['container'])==self.served_assets,
+            require(self.container_assets_source(active['container'],active['release_path'])==self.served_assets,
                     'Running world serves a release directory; a handoff is required')
             self.healthy(active['container'],old_path,old,time.monotonic()+self.c.get('health_timeout_seconds',15))
             build_logs.emit('Deployment: publishing assets onto the running world.')
