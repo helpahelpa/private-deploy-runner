@@ -128,6 +128,24 @@ class ClientBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'regular files'):
                 build.snapshot(repo, commit, root / 'snapshot')
 
+    def test_packaging_source_change_invalidates_the_material_apk_identity(self):
+        """Release 98 reused the cached APK after a packaging change; it must not."""
+        digest = {name: 'digest-' + name for name in build.PACKAGING_FILES}
+        self.assertEqual(len(build.PACKAGING_FILES), len(build.packaging_sources(digest)))
+        with self.assertRaisesRegex(ValueError, 'packaging source is missing'):
+            build.packaging_sources({'Bridge.java': 'x'})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); vendor = root / 'vendor'; vendor.mkdir()
+            tool = root / 'compiler'; tool.write_bytes(b'compiler')
+            names = ('android', 'csc', 'dotnet', 'java', 'javac', 'r8')
+            config = {'image': 'sha256:' + '1' * 64, 'compile': {name: '/toolchain/' + name for name in names}}
+            inputs, tools = {'base': tool}, {name: tool for name in names}
+            material = dict({'Bridge.java': 'production'}, **build.packaging_sources(digest))
+            before = build.apk_fingerprint(material, inputs, vendor, tools, config)
+            changed = dict(material, **{'source/launch-build/multiplayer_manifest.py': 'different'})
+            self.assertNotEqual(build.apk_fingerprint(changed, inputs, vendor, tools, config), before)
+            self.assertEqual(build.apk_fingerprint(material, inputs, vendor, tools, config), before)
+
     def test_only_java_and_cs_production_blobs_enter_compiler(self):
         entries = {'launch-build/multiplayer-client/PrivateActivity.java': '1',
                    'launch-build/multiplayer-client/Bridge.java': '2',

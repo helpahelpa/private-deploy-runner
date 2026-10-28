@@ -8,7 +8,6 @@ import argparse
 import datetime
 import errno
 import hashlib
-import importlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -19,9 +18,9 @@ import sys
 import tempfile
 import time
 import uuid
-from types import SimpleNamespace
 import build_logs
 import native_apk
+import sign_client_apk
 import client_qa
 import component_inputs
 import git_source
@@ -32,6 +31,10 @@ import zipfile
 PRIVATE = Path(__file__).resolve().parents[1]
 VENDOR = PRIVATE / 'local/trusted-tooling/client-build'
 SHA = re.compile(r'[0-9a-f]{64}')
+PACKAGING_FILES = ('launch-build/prepare_multiplayer_client.py', 'launch-build/multiplayer_manifest.py',
+                   'launch-build/patch_multiplayer_client.py', 'launch-build/patch_local_accounts.py',
+                   'launch-build/patch_tempering_ui.py', 'launch-build/prepare_tempering_update.py',
+                   'launch-build/patch_clone_coop.py', 'server/patch_apk_version.py')
 COMMIT = re.compile(r'[0-9a-f]{40}')
 DIAGNOSTICS = None
 
@@ -220,6 +223,16 @@ def production_sources(hashes):
     return result
 
 
+def packaging_sources(hashes):
+    """Packaging code from the commit is material: it assembles the signed APK."""
+    result = {}
+    for name in PACKAGING_FILES:
+        if name not in hashes:
+            raise ValueError('Client packaging source is missing: ' + name)
+        result['source/' + name] = hashes[name]
+    return result
+
+
 def apk_fingerprint(production, inputs, vendor, tools, config):
     # Test drivers, fixtures, test counts and asset-release allocations cannot
     # change installed native content. Packaging/compiler code remains pinned.
@@ -359,7 +372,8 @@ def build(args):
         qa_tree = component_inputs.client_source(tree)
         (source / 'server/logs').mkdir(parents=True, exist_ok=True)
         prod = production_sources(tree)
-        apk_key = apk_fingerprint(prod, inputs, vendor, tool_pins, config)
+        packaging = packaging_sources(tree)
+        apk_key = apk_fingerprint(dict(prod, **packaging), inputs, vendor, tool_pins, config)
         cache_root = config.get('apk_cache', str(Path(args.config).resolve().parent / 'signed-apk-cache'))
         store = native_apk.Store(cache_root, config.get('minimum_native_version_code', 1))
         with store.locked():
@@ -560,34 +574,8 @@ def build(args):
             with qa_store.locked():
                 qa_store.publish(qa_key, args.commit, tests, b'\n'.join(test_output), required_ids, minimum_tests)
         # Source tests only see read-only source, copied fixtures and toolchain mounts.
-        # The signer is loaded only after every test container has exited.
-        sys.path[:0] = [str(root / 'launch-build'), str(root / 'server')]
-        builder = importlib.import_module('prepare_multiplayer_client')
-        builder.ROOT = root
-        builder.LOCAL = stage / 'artifacts'
-        builder.LOCAL.mkdir()
-        # Pure binary transforms have their own material cache. Release-specific
-        # wrappers, manifests, checksums, endpoint properties and signing stay in
-        # the reviewed packager and are regenerated/verified for every request.
-        patch_modules = {name: importlib.import_module(module) for name, module in
-                         (('multiplayer', 'patch_multiplayer_client'), ('cooperative', 'patch_clone_coop'))}
-        patch_policy, patch_pins = build_artifacts.patch_policy(root)
-        pins.update(patch_pins)
-        patch_store = build_artifacts.Store(config.get('artifact_cache',
-            str(Path(args.config).resolve().parent / 'client-build-artifacts')))
-        artifact_receipts = {}
-        for name, module in patch_modules.items():
-            if not Path(module.__file__).resolve().is_relative_to(root):
-                raise ValueError('Only reviewed private transforms may run on the host')
-            original = module.patch_pe
-            def transform(raw, name=name, original=original):
-                result, evidence = patch_store.transform(name, patch_policy, raw, original,
-                    verify=lambda: verify_unchanged(patch_pins))
-                artifact_receipts[name] = evidence
-                build_logs.emit('Client binary transform ' + name + ': '
-                    + ('cache hit; verified output reused.' if evidence['reused'] else 'computed and cached.'))
-                return result
-            module.patch_pe = transform
+        # No repository Python runs on the host: assembly happens in the sandbox and
+        # the signing identity is read here, after every sandbox container exited.
         from cryptography import x509
         from cryptography.hazmat.primitives import serialization
         cert = x509.load_pem_x509_certificate(inputs['cert'].read_bytes())
@@ -595,6 +583,11 @@ def build(args):
         # The lock covers the second lookup and durable version reservation.
         # Publication rechecks the cache after privacy/frozen-input validation;
         # concurrent operator prebuilds can never reuse a reserved version.
+        package_out = stage / 'packaged'
+        package_out.mkdir(mode=0o777)
+        package_out.chmod(0o777)
+        artifacts = stage / 'artifacts'
+        artifacts.mkdir()
         with store.locked():
             reusable = store.lookup(apk_key)
             if reusable:
@@ -604,51 +597,76 @@ def build(args):
                     raise ValueError('Cached APK signing identity differs from the pinned certificate')
                 apk_version_code, apk_version_name = metadata['version_code'], metadata['version_name']
                 same_helper = digest(compiled_helper) == digest(inputs['helper'])
-                builder.signing_pair = lambda _: (_ for _ in ()).throw(ValueError('Reused APK must not be signed again'))
             else:
-                import multiplayer_manifest
                 with zipfile.ZipFile(inputs['base_apk']) as base:
-                    base_version_code, _ = multiplayer_manifest.manifest_version(base.read('AndroidManifest.xml'))
+                    base_version_code = sign_client_apk.apk_manifest_facts(base.read('AndroidManifest.xml'))['versionCode']
                 apk_version_code = store.reserve(base_version_code)
                 apk_version_name = '4.2.0.' + str(apk_version_code)
                 key = serialization.load_pem_private_key(inputs['key'].read_bytes(), password=None)
                 if key.public_key().public_numbers() != cert.public_key().public_numbers():
                     raise ValueError('Persistent signing identity mismatch')
-                builder.signing_pair = lambda _: (key, cert)
             helper_manifest['runtime_sha256'] = digest(compiled_helper)
             write_json(compiled_helper.with_suffix('.build.json'), helper_manifest)
-            bridge_names = validate_bridge_classes(builder.dex_classes(compiled_dex))
-            builder.compile_bridge = lambda scratch, receipt: (compiled_dex, [], bridge_names)
-            def verify_signed(command):
-                apk = Path(command[-1])
-                java = compile_config['java']
-                code = 'import subprocess; subprocess.run(' + repr([str(Path(java).parent / 'jarsigner'), '-verify', '/verify/client.apk']) + ',check=True,capture_output=True)'
-                execute(container_command(config, [*common_mounts, (apk.parent, '/verify')], ['-c', code.replace('/verify/client.apk', '/verify/' + apk.name)]), timeout=120)
-            builder.run = verify_signed
-            connection = builder.connection_properties(config.get('connection'))
+            validate_bridge_classes(sign_client_apk.dex_classes(compiled_dex))
             connection_path = stage / 'connection.json'
             write_json(connection_path, config.get('connection'))
-            package_args = SimpleNamespace(output=builder.LOCAL / 'client.apk', assets_root=builder.LOCAL / 'assets',
-                version=args.version, apk_version_code=apk_version_code, apk_version_name=apk_version_name,
-                base_apk=inputs['base_apk'], client_source=inputs['client_source'], ca=inputs['ca'],
-                expected_ca_sha256=digest(inputs['ca']), toolchain=inputs['android_receipt'],
-                coop_runtime=compiled_helper, connection_config=connection_path if config.get('connection') else None,
-                apk_download_credentials=credential,
-                require_existing_signing_identity=False,
-                reuse_apk=reusable['path'] if reusable else None,
-                reuse_apk_report=reusable['build_report'] if reusable else None)
-            builder.build(package_args)
-            build_report = json.loads((builder.LOCAL / 'client.build.json').read_text())
-            manifest_tool = importlib.import_module('multiplayer_manifest')
-            with zipfile.ZipFile(package_args.output) as packaged:
-                actual_version = manifest_tool.manifest_version(packaged.read('AndroidManifest.xml'))
-            if actual_version != (apk_version_code, apk_version_name):
+            # The commit's own packager assembles the APK inside the isolation
+            # sandbox, which never sees a signing identity. Only verified output
+            # returns, and the trusted host signs it afterwards.
+            mounts = [(source, '/source'), (inputs['base_apk'], '/inputs/base.apk'),
+                      (inputs['client_source'], '/inputs/client-source.bin'),
+                      (inputs['ca'], '/inputs/ca.crt'),
+                      (inputs['android_receipt'], '/inputs/android-receipt.json'),
+                      (compile_out / 'classes.dex', '/inputs/classes2.dex'),
+                      (compiled_helper, '/inputs/CoopRuntime.dll'),
+                      (compiled_helper.with_suffix('.build.json'), '/inputs/CoopRuntime.build.json'),
+                      (connection_path, '/inputs/connection.json')]
+            if credential is not None:
+                mounts.append((credential, '/inputs/apk-download.json'))
+            command = ['/source/launch-build/prepare_multiplayer_client.py', '--unsigned', '--output-root', '/out',
+                       '--base-apk', '/inputs/base.apk', '--client-source', '/inputs/client-source.bin',
+                       '--ca', '/inputs/ca.crt', '--expected-ca-sha256', digest(inputs['ca']),
+                       '--toolchain', '/inputs/android-receipt.json', '--compiled-dex', '/inputs/classes2.dex',
+                       '--coop-runtime', '/inputs/CoopRuntime.dll', '--version', args.version,
+                       '--apk-version-code', str(apk_version_code), '--apk-version-name', apk_version_name,
+                       '--output', '/out/client/client.unsigned.apk', '--assets-root', '/out/client/assets']
+            if config.get('connection'):
+                command += ['--connection-config', '/inputs/connection.json']
+            if credential is not None:
+                command += ['--apk-download-credentials', '/inputs/apk-download.json']
+            execute(container_command(config, mounts, command, package_out),
+                    timeout=config.get('package_timeout', 900))
+            unsigned = package_out / 'client/client.unsigned.apk'
+            assembled = json.loads((package_out / 'client/client.unsigned.build.json').read_text())
+            if assembled.get('unsigned') is not True:
+                raise ValueError('Isolated packager did not report an unsigned APK')
+            packaged_apk = artifacts / 'client.apk'
+            evidence = sign_client_apk.sign(unsigned, packaged_apk, inputs['key'], inputs['cert'],
+                {'package': assembled['package'], 'version_code': apk_version_code,
+                 'version_name': apk_version_name, 'download_credential': credential})
+            facts = evidence['facts']
+            if (facts['versionCode'], facts['versionName']) != (apk_version_code, apk_version_name):
                 raise ValueError('Signed APK Android version differs from its build metadata')
             if credential is not None:
-                verify_download_credential_payload(package_args.output, credential, builder.download_credentials)
+                verify_download_credential_payload(packaged_apk, credential, sign_client_apk.credential_payload)
+            with zipfile.ZipFile(packaged_apk) as packaged:
+                if packaged.read('classes2.dex') != (compile_out / 'classes.dex').read_bytes():
+                    raise ValueError('Packaged supplementary DEX differs from the compiler output')
+            build_report = dict(assembled, apk=str(packaged_apk), apk_sha256=evidence['sha256'],
+                                unsigned_apk_sha256=evidence['unsigned_sha256'],
+                                signing_certificate_sha256=evidence['signing_certificate_sha256'],
+                                signing='Unsigned assembly in the isolation sandbox; v1 signature applied on the trusted host')
+            write_json(artifacts / 'client.build.json', build_report)
+            artifact_receipts = {'multiplayer': {'patched_client_raw_sha256': assembled['patched_client_raw_sha256']},
+                                 'cooperative': {'patched_wrapper_sha256': assembled['patched_wrapper_sha256']}}
+            for asset in sorted((package_out / 'client/assets').rglob('*'), key=str):
+                if asset.is_file():
+                    target = artifacts / 'assets' / asset.relative_to(package_out / 'client/assets')
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(asset.read_bytes())
             if reusable:
-                if digest(package_args.output) != reusable['metadata']['sha256']:
-                    raise ValueError('Reused signed APK bytes changed during asset preparation')
+                if digest(packaged_apk) != reusable['metadata']['sha256']:
+                    raise ValueError('Reused signed APK bytes changed during assembly')
                 apk_source_commit = reusable['source_commit']
             else:
                 native_manifest = dict(build_report, apk_version_code=apk_version_code, apk_version_name=apk_version_name)
@@ -658,7 +676,7 @@ def build(args):
                 apk_source_commit = args.commit
         build_logs.emit('Signed APK reused byte-for-byte.' if reusable else 'Android client packaged and signed successfully.')
         # Scan every decompressed entry for explicitly configured private route/credential strings.
-        with zipfile.ZipFile(package_args.output) as apk:
+        with zipfile.ZipFile(packaged_apk) as apk:
             for entry in apk.infolist():
                 raw = apk.read(entry)
                 if any(secret.encode() in raw for secret in config.get('forbidden_apk_strings', []) if secret):
@@ -674,8 +692,8 @@ def build(args):
             with store.locked():
                 existing = store.lookup(apk_key)
                 if existing is None:
-                    store.publish(apk_key, args.commit, package_args.output, native_manifest, portable_report)
-                elif existing['metadata']['sha256'] != digest(package_args.output):
+                    store.publish(apk_key, args.commit, packaged_apk, native_manifest, portable_report)
+                elif existing['metadata']['sha256'] != digest(packaged_apk):
                     raise ValueError('Concurrent native APK publication differs')
         receipt = {'schema': 1, 'commit': args.commit, 'passed': True, 'source_files': tree,
                    'qa': dict(qa_totals, input_sha256=qa_key, tested_source_commit=tested_source_commit,
@@ -686,16 +704,14 @@ def build(args):
                               boundary='isolated client inputs, shared server production, fixtures, harness, configuration, tools and compiled payload'),
                    'production_sources': prod, 'fixture_sha256': fixture_pins, 'commands': tests,
                    'verified_apk': {'input_sha256': apk_key, 'source_commit': apk_source_commit,
-                                    'sha256': digest(package_args.output), 'version_code': apk_version_code,
+                                    'sha256': digest(packaged_apk), 'version_code': apk_version_code,
                                     'version_name': apk_version_name, 'reused': bool(reusable)},
                    'inputs_before': source_before, 'inputs_after': source_after,
                    'stable': source_before == source_after,
                    'sandbox': {'image': config['image'], 'network': 'none', 'read_only': True,
                                'user': '1000:1000', 'capabilities': [], 'signing_keys_mounted': False},
                    'completed_utc': datetime.datetime.now(datetime.timezone.utc).isoformat()}
-        artifacts = builder.LOCAL
-        # Replace original builder's machine-path-heavy report with portable provenance.
-        build_report = json.loads((artifacts / 'client.build.json').read_text())
+        # Replace the sandbox builder's machine-path-heavy report with portable provenance.
         (artifacts / 'client.build.json').unlink()
         write_json(artifacts / 'client-tests.json', receipt)
         with os.fdopen(os.open(artifacts / 'tests.private.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
@@ -710,7 +726,7 @@ def build(args):
                     'apk_reused': bool(reusable),
                     'assets': 'assets', 'asset_files': asset_hashes,
                     'client_tests_receipt': 'client-tests.json', 'client_tests_sha256': digest(artifacts / 'client-tests.json'),
-                    'build_inputs': prod,
+                    'build_inputs': dict(prod, **packaging),
                     'private_input_sha256': {name: digest(path) for name, path in inputs.items() if name != 'key'},
                     'toolchain_sha256': {name: digest(path) for name, path in tool_pins.items()},
                     'trusted_builder_sha256': {str(p.relative_to(PRIVATE)): expected for name, expected in sorted(trusted_pins.items()) for p in [Path(name)]},
@@ -719,7 +735,7 @@ def build(args):
                     'signing_certificate_sha256': build_report['signing_certificate_sha256'],
                     'runtime_sha256': digest(compiled_helper), 'established_helper_preserved': same_helper,
                     'build_artifacts': artifact_receipts,
-                    'connection_properties_sha256': hashlib.sha256(connection).hexdigest()}
+                    'connection_properties_sha256': digest(connection_path) if config.get('connection') else hashlib.sha256(b'').hexdigest()}
         update_manifest = native_apk.update_metadata(manifest, artifacts / 'client.apk')
         write_json(artifacts / 'assets/apk-update.json', update_manifest)
         manifest['asset_files']['apk-update.json'] = digest(artifacts / 'assets/apk-update.json')
