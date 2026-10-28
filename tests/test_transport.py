@@ -34,7 +34,9 @@ class TransportTests(unittest.TestCase):
                  "deploy/cloudflare/test_wss_gateway.py", "deploy/cloudflare/test_outbound443_worker.mjs",
                  "deploy/cloudflare/outbound443_worker.mjs", "server/multiplayer_server.py",
                  "server/native_contracts.json", "deploy/multiplayer/create_private_certs.py",
-                 "deploy/cloudflare/local.env", "deploy/cloudflare/local/private.py"]
+                 "deploy/cloudflare/local.env", "deploy/cloudflare/local/private.py",
+                 "deploy/admin/agent.py", "deploy/admin/test_agent.py", "deploy/admin/test_worker.mjs",
+                 "tools/private_admin.py", "tools/test_admin_cli.py", "deploy/admin/local/private.py"]
         for name in names:
             path = source / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +55,10 @@ class TransportTests(unittest.TestCase):
         destination = self.root / "curated"
         destination.mkdir()
         hashes = gate.snapshot(source, commit, destination)
+        for name in ("deploy/admin/agent.py", "deploy/admin/test_agent.py", "deploy/admin/test_worker.mjs",
+                     "tools/private_admin.py", "tools/test_admin_cli.py"):
+            self.assertIn(name, hashes)
+        self.assertNotIn("deploy/admin/local/private.py", hashes)
         self.assertNotIn("deploy/cloudflare/local.env", hashes)
         self.assertNotIn("deploy/cloudflare/local/private.py", hashes)
         self.assertFalse((destination / "deploy/cloudflare/local").exists())
@@ -74,18 +80,25 @@ class TransportTests(unittest.TestCase):
             gate.snapshot(source, commit, destination)
 
     def test_sandboxes_have_only_curated_readonly_source_and_disposable_writable_paths(self):
+        for name in ('deploy/cloudflare/test_old.py','deploy/admin/test_agent.py','tools/test_admin_cli.py',
+                     'deploy/cloudflare/test_outbound443_worker.mjs','deploy/admin/test_worker.mjs'):
+            path=self.root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('# Test fixture')
         for language in ("python", "node"):
             argv = gate.container(IMAGE, self.root, language)
             for flag in ("--network=none", "--read-only", "--user=1000:1000", "--cap-drop=ALL",
                          "--security-opt=no-new-privileges:true", "--pull=never"):
                 self.assertIn(flag, argv)
             mounts = [value for value in argv if value.startswith("type=bind,")]
-            self.assertEqual(mounts, [f"type=bind,src={self.root},dst=/source,readonly"])
+            self.assertIn(f"type=bind,src={self.root},dst=/source,readonly",mounts)
+            self.assertTrue(all(value.endswith(',readonly') for value in mounts))
             self.assertEqual([value for value in argv if value.startswith("--env=")],
                              ["--env=HOME=/tmp", "--env=PYTHONDONTWRITEBYTECODE=1"])
             self.assertFalse(any("docker.sock" in value or "token" in value or "secret" in value for value in argv))
-        self.assertEqual(gate.container(IMAGE, self.root, "python")[-8:],
-                         ["-m", "unittest", "discover", "-s", "deploy/cloudflare", "-p", "test_*.py", "-v"])
+        python=gate.container(IMAGE,self.root,'python')
+        self.assertEqual(['deploy/cloudflare','deploy/admin','tools'],json.loads(python[python.index('--directories')+1]))
+        node=gate.container(IMAGE,self.root,'node')
+        self.assertIn('/source/deploy/admin/test_worker.mjs',node)
+        self.assertIn('/source/deploy/cloudflare/test_outbound443_worker.mjs',node)
 
     def test_python_requires_baseline_and_zero_skips_or_expected_failures(self):
         self.assertEqual(gate.python_result(PYTHON_OK, 60)["passed"], 60)

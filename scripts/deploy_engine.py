@@ -25,6 +25,7 @@ import component_inputs
 import git_source
 import client_qa
 import qa_tasks
+import admin_runtime
 
 BASE = 'python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72'
 PROTOCOL = 'clone-coop-handoff-v1'
@@ -64,7 +65,7 @@ DOCKERFILE = '''FROM %s
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY --chown=1000:1000 server/ /app/server/
-RUN mkdir -p /data /app/server/logs && chown -R 1000:1000 /data /app/server/logs
+RUN mkdir -p /data /admin /app/server/logs && chown -R 1000:1000 /data /admin /app/server/logs
 USER 1000:1000
 ENTRYPOINT ["python", "/app/server/multiplayer_server.py"]
 ''' % BASE
@@ -232,10 +233,10 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
             objects[name.decode('utf-8')]=(mode.decode(),kind.decode(),oid.decode())
         committed=list(objects)
         curated=[n for n in committed if (n.startswith('server/') and '/' not in n[len('server/'):] and (n.endswith('.py') or n=='server/native_contracts.json'))]
-        potential_fixtures=[n for n in committed if (n.startswith('launch-build/') and n.endswith('.py')) or (n.startswith('server/test_') and n.endswith('.json'))]
+        potential_fixtures=[n for n in committed if (n.startswith('launch-build/') and n.endswith('.py')) or (n.startswith('server/test_') and n.endswith('.json')) or component_inputs.server_fixture(n)]
         for name in set(curated+potential_fixtures):
             source_build_path(name)
-        fixture_names=[n for n in potential_fixtures if n in component_inputs.SERVER_FIXTURES or n.startswith('server/')]
+        fixture_names=[n for n in potential_fixtures if component_inputs.server_fixture(n) or n.startswith('server/')]
         selected=sorted(set(curated+fixture_names))
         require(all(objects[n][0] in ('100644','100755') and objects[n][1]=='blob' for n in selected),'Unsafe server source kind')
         contents=dict(zip(selected,git_source.read_blobs(source,[objects[n][2] for n in selected])))
@@ -266,7 +267,7 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
                     'game_data':tree(data) if data else None,
                     'game_text':digest(text) if text else None,'base':BASE,'dockerfile':DOCKERFILE,
                     'compatibility':data_compatibility,'protocol':PROTOCOL,'workers':qa_workers,
-                    'engine':digest(__file__),'qa_runner':digest(server_qa.__file__),'module_cache':digest(qa_tasks.__file__),
+                    'engine':digest(__file__),'admin_runtime':digest(admin_runtime.__file__),'qa_runner':digest(server_qa.__file__),'module_cache':digest(qa_tasks.__file__),
                     'evidence_validator':digest(client_qa.__file__),'build_logging':digest(build_logs.__file__),
                     'host_tools':{name:digest(Path(found).resolve()) if (found:=shutil.which(name)) else None for name in ('docker','openssl')},
                     'minimum_tests':server_qa.MINIMUM_TESTS}
@@ -487,6 +488,7 @@ class Engine:
         require(c['https_port'] != c['game_port'], 'Loopback ports must differ')
         require(isinstance(c.get('asset_origin'),str) and c['asset_origin'].startswith('https://') and '\n' not in c['asset_origin'], 'HTTPS asset origin required')
         require(type(c.get('backup_limit_bytes')) is int and 0 < c['backup_limit_bytes'] <= 128*1024*1024, 'Snapshot size bound must fit 128MiB staging limit')
+        self.admin=admin_runtime.AdminRuntime(self)
 
     @contextmanager
     def lock(self, wait_seconds=0):
@@ -545,7 +547,7 @@ class Engine:
         result=json.loads(reply);require(result.get('ok') is True and isinstance(result.get('data'),dict),'Authenticated control rejected')
         return result['data']
 
-    def mounts(self,release):
+    def mounts(self,release,admin_enabled=None):
         c=self.c
         for key in ('game_data','certificates','control'):
             require(c[key].is_dir() and not c[key].is_symlink(),'Required runtime directory missing')
@@ -555,19 +557,21 @@ class Engine:
         for name in ('server.crt','server.key','ca.crt'):
             p=c['certificates']/name;require(p.is_file() and not p.is_symlink(),'TLS identity missing')
             mounts.append(('bind',str(p),'/certs/'+name,True))
-        return mounts
+        return mounts+self.admin.mounts(self.admin.enabled() if admin_enabled is None else admin_enabled)
 
     def validate_container(self,cid,release,manifest,*,running=True,deadline=None):
         def budget():return max(.05,min(3,deadline-time.monotonic())) if deadline else 30
         data=self.inspect(cid,timeout=budget());host=data['HostConfig'];cfg=data['Config']
         require(data['Image']==manifest['image'] and (not running or data['State']['Running']),'World image/state mismatch')
-        require(set(host.get('Tmpfs') or {})=={'/tmp','/app/server/logs'},'Unexpected world temporary mounts')
+        enabled=self.admin.enabled(cid)
+        require(set(host.get('Tmpfs') or {})==({'/tmp'} if enabled else {'/tmp','/app/server/logs'}),'Unexpected world temporary mounts')
+        self.admin.validate_world(cid,cfg)
         require(host.get('ReadonlyRootfs') and not host.get('Privileged') and host.get('NetworkMode')==self.network,'Unsafe world isolation')
         require(set(host.get('CapDrop') or [])=={'ALL'} and not host.get('CapAdd') and 'no-new-privileges:true' in (host.get('SecurityOpt') or []),'Unsafe world capabilities')
         require('TZ=Asia/Tokyo' in cfg.get('Env',[]),'World timezone mismatch')
         require(cfg.get('User')=='1000:1000' and host.get('RestartPolicy',{}).get('Name') in ('no',''),'Unsafe world user/restart policy')
         require(not host.get('Devices') and not host.get('DeviceRequests') and host.get('PidMode','')!='host' and host.get('IpcMode','')!='host','Host resources exposed')
-        expected={(kind,str(source),target,ro) for kind,source,target,ro in self.mounts(release)}
+        expected={(kind,str(source),target,ro) for kind,source,target,ro in self.mounts(release,enabled)}
         # Docker Desktop rewrites WSL bind sources to a deterministic broker
         # path. Match its exact distro label + SHA256(original source), never a
         # broad path-prefix exception.
@@ -602,6 +606,7 @@ class Engine:
                 require(status.get('release')==manifest['commit'] and status.get('compatibility')==PROTOCOL and not status.get('write_fenced'),'World control identity mismatch')
                 self.validate_container(cid,release,manifest,deadline=deadline)
                 self.validate_ingress(deadline=deadline)
+                self.admin.healthy(cid,timeout=max(.1,min(3,deadline-time.monotonic())))
                 context=ssl.create_default_context(cafile=str(self.c['certificates']/'ca.crt'))
                 connection=http.client.HTTPSConnection('localhost',self.c['https_port'],context=context,timeout=max(.05,min(2,deadline-time.monotonic())))
                 try:
@@ -617,6 +622,7 @@ class Engine:
 
     def ensure_network(self):
         self.docker('volume','inspect',self.c['data_volume'])
+        self.admin.preflight()
         try: found=json.loads(self.docker('network','inspect',self.network))[0]
         except DeploymentError:
             self.docker('network','create','--internal','--label','private.trusted-project='+self.c['project'],self.network)
@@ -680,9 +686,10 @@ class Engine:
             raise
         return cid
 
-    def start(self,release,manifest,handoff='',deadline=None):
+    def start(self,release,manifest,handoff='',deadline=None,*,admin_enabled=None):
         if not deadline:self.ensure_network();self.ensure_ingress()
-        c=self.c
+        c=self.c;enabled=self.admin.enabled() if admin_enabled is None else admin_enabled
+        require(type(enabled) is bool and (not enabled or self.admin.config is not None),'Invalid admin runtime selection')
         name=c['project']+'-world-'+manifest['commit'][:12]+'-'+uuid.uuid4().hex[:8]
         args=['create','--name',name,
               '--label','private.trusted-project='+c['project'],'--label','private.release='+manifest['commit'],
@@ -690,19 +697,22 @@ class Engine:
               '--network',self.network,'--network-alias',self.world_alias,'--env','TZ='+c.get('timezone','Asia/Tokyo'),'--read-only','--user','1000:1000','--cap-drop','ALL',
               '--security-opt','no-new-privileges:true','--restart','no','--init','--pids-limit','256','--memory','2g',
               '--tmpfs','/tmp:rw,nosuid,nodev,size=32m,mode=1777',
-              '--tmpfs','/app/server/logs:rw,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=0700',
               ]
-        for kind,source,target,ro in self.mounts(release):
+        if not enabled:args+=['--tmpfs','/app/server/logs:rw,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=0700']
+        for kind,source,target,ro in self.mounts(release,enabled):
             args+=['--mount','type=%s,src=%s,dst=%s%s'%(kind,source,target,',readonly' if ro else '')]
         args += [manifest['image'],'--host=0.0.0.0','--container-only','--world=/data/world.sqlite3','--auth-db=/data/auth.sqlite3',
                  '--cert=/certs/server.crt','--key=/certs/server.key','--assets=/assets','--update-config=/assets/update_config.json',
                  '--asset-origin='+c['asset_origin'],'--deployment-control=/control/socket','--deployment-secret=/control/secret',
                  '--deployment-release='+manifest['commit']]
+        args+=self.admin.flags(enabled)
         if handoff:args+=['--deployment-id='+handoff]
         timeout=max(.1,deadline-time.monotonic()) if deadline else 30
         try:
             cid=self.docker(*args,timeout=timeout).decode().strip()
+            self.admin.modes[cid]=enabled
             self.docker('start',cid,timeout=max(.1,deadline-time.monotonic()) if deadline else 15)
+            self.admin.attach(cid,deadline)
             return cid
         except Exception:
             try:self.docker('stop','--time','2',name,timeout=4)
@@ -760,6 +770,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
     def record_active(self,cid,release,manifest):
         value={'release':manifest['commit'],'image':manifest['image'],'container':cid,'release_path':str(release),
                'ingress':self.ingress_id(),'assets_sha256':hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()}
+        value.update(self.admin.record(cid))
         write_json(self.root/'active.json',value)
         if self.c.get('runtime_registry'):write_json(self.c['runtime_registry'],value)
         return value
@@ -819,6 +830,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             self.docker('image','load','--input',str(path/'server-image.tar'),timeout=1800)
             require(json.loads(self.docker('image','inspect',new['image']))[0]['Id']==new['image'],'Loaded image identity mismatch')
             self.ensure_network();self.ensure_ingress();self.mounts(path);self.volume_preflight(new['image'])
+            if self.admin.enabled() and not rollback:require(self.admin.supported(path),'Configured admin runtime requires an admin-capable release')
             if not rollback:self.check_desired(new['commit'])
             build_logs.emit('Deployment: target release and current world validated.')
             deployment=uuid.uuid4().hex;receipt=self.root/'deployments'/(deployment+'.json')
@@ -836,13 +848,15 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                 self.control({'op':'prepare','id':deployment,'target_release':new['commit'],'compatibility':PROTOCOL,'timeout_seconds':self.c.get('handoff_timeout_seconds',30)},budget())
                 self.control({'op':'commit','id':deployment},budget());fenced=True
                 build_logs.emit('Deployment: previous world fenced against writes.')
+                self.admin.detach(active['container'],deadline)
                 self.docker('stop','--time','2',active['container'],timeout=min(3,max(.1,deadline-time.monotonic())));stopped=True
                 build_logs.emit('Deployment: previous world stopped.')
                 snapshot=self.snapshot(deployment,new['image'],deadline)
                 build_logs.emit('Deployment: consistent snapshot verified; automatic data restore disabled.')
                 require(time.monotonic()<deadline-2,'Handoff budget exhausted before activation')
                 build_logs.emit('Deployment: starting replacement container.')
-                new_cid=self.start(path,new,deployment,deadline)
+                runtime_options={'admin_enabled':self.admin.supported(path)} if self.admin.enabled() else {}
+                new_cid=self.start(path,new,deployment,deadline,**runtime_options)
                 require(new_cid!=active['container'],'Replacement must use a new container')
                 self.healthy(new_cid,path,new,min(deadline,time.monotonic()+self.c.get('health_timeout_seconds',15)))
                 self.preserve_auth(snapshot,new['image'],deadline)
@@ -868,9 +882,11 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                     try:
                         # Never resume a consumed permit and never restore a DB.
                         build_logs.emit('Deployment: rolling back code while preserving current player data.')
-                        if new_cid:self.docker('stop','--time','2',new_cid,timeout=4)
+                        if new_cid:
+                            self.admin.detach(new_cid)
+                            self.docker('stop','--time','2',new_cid,timeout=4)
                         self.docker('stop','--time','2',active['container'],timeout=4)
-                        rollback_cid=self.start(old_path,old)
+                        rollback_cid=self.start(old_path,old,admin_enabled=active.get('admin_enabled',False))
                         self.healthy(rollback_cid,old_path,old,time.monotonic()+self.c.get('health_timeout_seconds',15))
                         self.record_active(rollback_cid,old_path,old);event['phase']='rolled_back_code_only'
                     except Exception:event['phase']='recovery_required'
@@ -893,6 +909,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             if not state['State']['Running']:
                 self.refresh_desktop_binds(path,manifest,state)
                 self.docker('start',active['container'],timeout=10)
+            self.admin.attach(active['container'],restarted=not state['State']['Running'])
             self.healthy(active['container'],path,manifest,time.monotonic()+self.c.get('health_timeout_seconds',15))
             self.record_active(active['container'],path,manifest)
             return {'release':manifest['commit'],'recovered':True,'container':active['container'],'ingress':self.ingress_id()}
@@ -902,7 +919,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
         if validated['State']['Running']:return
         distro=validated['Config'].get('Labels',{}).get('desktop.docker.io/wsl-distro','')
         if not re.fullmatch(r'[A-Za-z0-9_.-]+',distro):return
-        binds=[(source,target) for kind,source,target,ro in self.mounts(release) if kind=='bind']
+        binds=[(source,target) for kind,source,target,ro in self.mounts(release,self.admin.enabled(validated.get('Id'))) if kind=='bind']
         translated={'/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/'+distro+'/'+hashlib.sha256(source.encode()).hexdigest()
                     for source,target in binds}
         if not any(m['Type']=='bind' and m['Source'] in translated for m in validated['Mounts']):return

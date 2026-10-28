@@ -21,7 +21,7 @@ class WorldService:
     @staticmethod
     def identity(active):
         return tuple(active.get(name) for name in
-                     ('release', 'image', 'container', 'release_path', 'ingress', 'assets_sha256'))
+                     ('release', 'image', 'container', 'release_path', 'ingress', 'assets_sha256', 'admin_enabled', 'admin_relay'))
 
     def running(self, cid):
         # Read-only, bounded probes deliberately avoid the engine's per-command
@@ -42,7 +42,9 @@ class WorldService:
                 active = engine.active()
                 observed = self.identity(active)
             if self.verified == observed and self.clock() < self.next_verification:
-                if self.running(active['container']) and self.running(active.get('ingress')):
+                if (self.running(active['container']) and self.running(active.get('ingress'))
+                        and (not active.get('admin_enabled') or self.running(active.get('admin_relay')))):
+                    if active.get('admin_enabled'):engine.admin.check_egress(timeout=3)
                     state = engine.control({'op': 'status'}, timeout=2)
                     if (state.get('release') == active['release'] and
                             state.get('compatibility') == PROTOCOL and

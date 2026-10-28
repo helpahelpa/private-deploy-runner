@@ -77,8 +77,8 @@ def git(source, *args):
 
 def curated(name):
     path = PurePosixPath(name)
-    return ((path.parent == PurePosixPath("deploy/cloudflare") and path.suffix in (".py", ".mjs"))
-            or (path.parent == PurePosixPath("server") and path.suffix == ".py")
+    return ((path.parent in (PurePosixPath("deploy/cloudflare"), PurePosixPath("deploy/admin")) and path.suffix in (".py", ".mjs"))
+            or (path.parent in (PurePosixPath("server"), PurePosixPath("tools")) and path.suffix == ".py")
             or name in ("server/native_contracts.json", "deploy/multiplayer/create_private_certs.py"))
 
 
@@ -130,17 +130,21 @@ def container(image, source, language, worker=None, workers=1):
              "--tmpfs=/source/server/logs:rw,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=0700",
              "--mount", f"type=bind,src={source},dst=/source,readonly"]
     if language == "python":
-        if worker is not None:
-            require(type(workers) is int and 1 <= workers <= 3 and type(worker) is int and 0 <= worker < workers)
-            # Streaming TLS fixtures need little RAM; reserve headroom for the
-            # four client and two server workers on the same machine.
-            flags[flags.index('--memory=2g')] = '--memory=1g'
-            flags[flags.index('--cpus=2')] = '--cpus=1'
-            flags += ['--mount',f'type=bind,src={Path(server_qa.__file__).resolve()},dst=/trusted/server_qa.py,readonly']
-            return flags + ['--entrypoint=python3',image,'/trusted/server_qa.py','--directory','deploy/cloudflare',
-                            '--worker',str(worker),'--workers',str(workers)]
-        return flags + ["--entrypoint=python3", image, "-m", "unittest", "discover", "-s", "deploy/cloudflare", "-p", "test_*.py", "-v"]
-    return flags + ["--entrypoint=node", image, "--test", "--test-reporter=tap", "/source/deploy/cloudflare/test_outbound443_worker.mjs"]
+        worker = 0 if worker is None else worker
+        require(type(workers) is int and 1 <= workers <= 3 and type(worker) is int and 0 <= worker < workers)
+        # Keep all transport/CLI modules in the same bounded worker pool.
+        flags[flags.index('--memory=2g')] = '--memory=1g'
+        flags[flags.index('--cpus=2')] = '--cpus=1'
+        flags += ['--mount',f'type=bind,src={Path(server_qa.__file__).resolve()},dst=/trusted/server_qa.py,readonly']
+        directories = ['deploy/cloudflare'] + [name for name in ('deploy/admin', 'tools')
+                        if any((source / name).glob('test_*.py'))]
+        return flags + ['--entrypoint=python3',image,'/trusted/server_qa.py','--directories',json.dumps(directories),
+                        '--worker',str(worker),'--workers',str(workers)]
+    tests = sorted(path for directory in ('deploy/cloudflare', 'deploy/admin')
+                   for path in (source / directory).glob('test_*.mjs'))
+    require(bool(tests))
+    return flags + ["--entrypoint=node", image, "--test", "--test-reporter=tap",
+                    *['/source/' + path.relative_to(source).as_posix() for path in tests]]
 
 
 def python_result(output, minimum):
@@ -183,7 +187,7 @@ def check(config, source, commit, output):
         outcomes = {}
         workers = config.get('python_workers',1)
         def run(language,index=None):
-            name = language if index is None else language+'-worker-'+str(index)
+            name = language if index is None or workers==1 else language+'-worker-'+str(index)
             log = output / (name + ".private.log")
             work = output / name;work.mkdir()
             try:
@@ -203,15 +207,14 @@ def check(config, source, commit, output):
             parser = python_result if language=='python' else node_result
             return parser(log.read_bytes(),config['minimum_'+language+'_tests'])
         with ThreadPoolExecutor(max_workers=workers+1,thread_name_prefix='transport-qa') as pool:
-            python=[pool.submit(run,'python',index) for index in range(workers)] if workers>1 else [pool.submit(run,'python')]
+            python=[pool.submit(run,'python',index) for index in range(workers)]
             node=pool.submit(run,'node')
             reports=[future.result() for future in python]
             outcomes['node']=node.result()
+        aggregate=server_qa.aggregate(reports,workers,config['minimum_python_tests'])
+        outcomes['python']=dict(aggregate,passed=aggregate['tests'])
         if workers>1:
-            aggregate=server_qa.aggregate(reports,workers,config['minimum_python_tests'])
-            outcomes['python']=dict(aggregate,passed=aggregate['tests'])
             private_log(output/'python.private.log',b'\n'.join((output/('python-worker-'+str(index)+'.private.log')).read_bytes() for index in range(workers)))
-        else:outcomes['python']=reports[0]
         for language in ('python','node'):
             outcomes[language]['log_sha256']=engine.digest(output/(language+'.private.log'))
         engine.build_logs.emit('Fresh transport QA complete: '+str(round(time.monotonic()-started,3))+' seconds; '+str(workers)+' Python workers.')

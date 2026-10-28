@@ -125,15 +125,20 @@ def flatten(suite):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--worker',type=int,default=0);parser.add_argument('--workers',type=int,default=1)
     parser.add_argument('--directory',default='.')
+    parser.add_argument('--directories',type=json.loads)
     parser.add_argument('--discover-only',action='store_true');parser.add_argument('--module')
     parser.add_argument('--modules',type=json.loads)
     args=parser.parse_args()
     started=time.monotonic()
     if args.module or args.modules:
         sys.path.insert(0,str(Path(args.directory).resolve()))
+    directories=args.directories if args.directories is not None else [args.directory]
+    if (not isinstance(directories,list) or not directories or len(directories)!=len(set(directories))
+            or any(not isinstance(name,str) or not name for name in directories)):
+        raise ValueError('Invalid QA discovery directories')
     suite=(unittest.defaultTestLoader.loadTestsFromNames(args.modules) if args.modules else
            unittest.defaultTestLoader.loadTestsFromName(args.module) if args.module else
-           unittest.defaultTestLoader.discover(args.directory,pattern='test_*.py'))
+           unittest.TestSuite(unittest.TestLoader().discover(directory,pattern='test_*.py') for directory in directories))
     tests=list(flatten(suite))
     inventory=sorted(test.id() for test in tests);groups=partition(inventory,args.workers)
     if args.discover_only:

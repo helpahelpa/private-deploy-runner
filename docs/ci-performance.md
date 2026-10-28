@@ -199,3 +199,31 @@ A deliberate failing assertion in the changed client module made the build fail,
 published no new QA evidence or release output, and left Main and the native
 version counter unchanged. Cache reuse did not mask the failure. Public workflow
 logs were also checked for configured secret and machine-identity literals.
+
+## Admin integration inputs
+
+Server QA stages committed flat administrative CLI modules matching
+`tools/*_admin.py` (excluding `test_*`) alongside the existing reviewed fixtures.
+These CLI files are mounted read-only at their original `/app/tools/` paths,
+never added to the runtime image, and hashed in both server component and
+module evidence. A CLI edit invalidates prior server QA evidence. The controller
+image creates `/admin` owned by the nonroot runtime user, ready for an optional
+state volume; this does not enable a listener or mount a volume.
+
+Fresh transport QA discovers Python tests in `deploy/cloudflare`, `deploy/admin`
+and `tools`, using one exact inventory partitioned across the existing bounded
+worker pool. Node runs every flat `test_*.mjs` in both relay directories. Nested
+private directories and configuration files remain excluded. Inputs still come
+from validated regular Git blobs, with read-only mounts, no external network,
+no credentials and frozen-source verification. Source code never executes on
+the host. The existing test floors and zero-failure/skip requirements remain.
+
+A disposable snapshot of the pending admin implementation passed all 96 Python
+transport/CLI checks and 32 Worker checks, including 26 CLI, 11 admin-agent and
+nine admin-Worker checks. This was an isolated check, without a deployment.
+
+The same snapshot passed all 770 server tests freshly, including the subprocess
+CLI-to-real-HTTPS integration and durable logging tests. An isolated image smoke
+check verified `/admin` is owned by UID/GID 1000 and the process runs as UID 1000.
+The controller suite retained 237 passing checks with five existing optional
+skips. These local checks did not dispatch a workflow or change Main/DEV.

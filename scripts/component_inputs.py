@@ -5,6 +5,12 @@ SERVER_FIXTURES = frozenset(('launch-build/qa_stage2_combat_fixture.py',
                              'launch-build/dev_tools.py', 'launch-build/screenshot_preview.py'))
 
 
+def server_fixture(name):
+    path = PurePosixPath(name)
+    return (name in SERVER_FIXTURES or (path.parent == PurePosixPath('tools')
+            and path.name.endswith('_admin.py') and not path.name.startswith('test_')))
+
+
 def client_source(tree):
     # The invitation client integration imports this one server test helper.
     # Server production remains shared: those integrations must run when it changes.
@@ -29,7 +35,7 @@ def identity(tree, component):
         source = client_source(tree)
     elif component == 'server':
         source = {name: value for name, value in tree.items()
-                  if name in SERVER_FIXTURES or name.startswith('server/')}
+                  if server_fixture(name) or name.startswith('server/')}
     else:
         raise ValueError('Unknown source component')
     return {'schema': 1, 'paths': sorted(tree), 'source': source, 'fallback': fallback_source(tree)}

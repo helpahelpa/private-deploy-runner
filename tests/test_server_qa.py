@@ -49,6 +49,15 @@ class CoverageTests(unittest.TestCase):
             result=subprocess.run([sys.executable,qa.__file__,'--modules',json.dumps(['test_alpha','test_beta'])],cwd=root,capture_output=True,text=True,check=True)
             report=json.loads(next(line[len(qa.MARKER):] for line in result.stdout.splitlines() if line.startswith(qa.MARKER)))
             self.assertEqual(['test_alpha.Tests.test_pass','test_beta.Tests.test_pass'],report['test_ids'])
+            extra=root/'extra';extra.mkdir()
+            (extra/'test_gamma.py').write_text('import unittest\nclass Tests(unittest.TestCase):\n def test_extra(self): self.assertTrue(True)\n')
+            reports=[]
+            for index in range(2):
+                result=subprocess.run([sys.executable,qa.__file__,'--directories',json.dumps(['.','extra']),
+                    '--worker',str(index),'--workers','2'],cwd=root,capture_output=True,text=True,check=True)
+                reports.append(json.loads(next(line[len(qa.MARKER):] for line in result.stdout.splitlines() if line.startswith(qa.MARKER))))
+            combined=qa.aggregate(reports,2,3)
+            self.assertEqual(['test_alpha.Tests.test_pass','test_beta.Tests.test_pass','test_gamma.Tests.test_extra'],combined['test_ids'])
 
 
 if __name__=='__main__':unittest.main()

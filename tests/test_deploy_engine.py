@@ -160,6 +160,8 @@ class ServerComponentTests(unittest.TestCase):
         (self.repo/'server/test_beta.py').write_text('# Independent synthetic test fixture\n')
         (self.repo/'launch-build/qa_stage2_combat_fixture.py').write_text('# Mounted fixture\n')
         (self.repo/'launch-build/client_only.py').write_text('# Client component only\n')
+        (self.repo/'tools').mkdir()
+        (self.repo/'tools/private_admin.py').write_text('# Administrative CLI fixture\n')
         (self.repo/'README.md').write_text('first')
         for args in (['init','--quiet'],['config','user.name','Fixture'],['config','user.email','fixture@example.invalid']):e.run(['git','-C',str(self.repo),*args])
         self.commit=self.commit_source('first')
@@ -186,6 +188,10 @@ class ServerComponentTests(unittest.TestCase):
         return b''
 
     def container(self,args,*,work,timeout,log):
+        cli_mounts=[value for value in args if value.endswith(',dst=/app/tools/private_admin.py,readonly')]
+        self.assertEqual(1,len(cli_mounts),'Server QA must be able to invoke its committed CLI dependency')
+        staged=Path(cli_mounts[0].split(',dst=')[0].removeprefix('type=bind,src='))
+        self.assertEqual((self.repo/'tools/private_admin.py').read_bytes(),staged.read_bytes())
         if '-c' in args:
             self.invariants+=1;Path(log).write_text('fresh invariant fixture pass\n');return b''
         if '--discover-only' in args:
@@ -238,7 +244,9 @@ class ServerComponentTests(unittest.TestCase):
         self.text.write_text('changed text');self.build('changed-text')
         (self.repo/'launch-build/qa_stage2_combat_fixture.py').write_text('# Changed mounted fixture\n');self.commit=self.commit_source('fixture')
         self.build('changed-fixture')
-        self.assertEqual((8,4,4),(len(self.calls),self.invariants,self.builds))
+        (self.repo/'tools/private_admin.py').write_text('# Changed administrative CLI\n');self.commit=self.commit_source('CLI fixture')
+        self.build('changed-cli-fixture')
+        self.assertEqual((10,5,5),(len(self.calls),self.invariants,self.builds))
 
     def test_changed_test_module_reuses_independent_evidence_but_shared_runtime_runs_both(self):
         self.build('first')
