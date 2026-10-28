@@ -193,9 +193,10 @@ class ServerComponentTests(unittest.TestCase):
                 ['test_alpha.A.test_a','test_beta.B.test_b']})+'\n').encode()
             Path(log).write_bytes(output);return output
         self.calls.append((tuple(args),str(work)))
-        if '--module' in args:
-            module=args[args.index('--module')+1]
-            selected=['test_alpha.A.test_a'] if module=='test_alpha' else ['test_beta.B.test_b']
+        if '--module' in args or '--modules' in args:
+            modules=(json.loads(args[args.index('--modules')+1]) if '--modules' in args
+                     else [args[args.index('--module')+1]])
+            selected=sorted('test_alpha.A.test_a' if module=='test_alpha' else 'test_beta.B.test_b' for module in modules)
             report=dict(test_ids=selected,tests=len(selected),passed=True,failures=0,errors=0,skipped=0)
             output=(e.server_qa.MARKER+json.dumps(report)+'\n').encode();Path(log).write_bytes(output);return output
         self.barrier.wait(3)
@@ -264,7 +265,7 @@ class ServerComponentTests(unittest.TestCase):
     def test_worker_cleanup_failure_cannot_publish_any_component(self):
         def failed(args,**kwargs):
             result=self.container(args,**kwargs)
-            if '--module' in args and args[args.index('--module')+1]=='test_alpha':raise e.DeploymentError('Synthetic worker cleanup failure')
+            if '--modules' in args and 'test_alpha' in json.loads(args[args.index('--modules')+1]):raise e.DeploymentError('Synthetic worker cleanup failure')
             return result
         with patch.object(e,'run_test_container',side_effect=failed),self.assertRaises(e.DeploymentError):self.build('failed')
         self.assertEqual(2,len(self.calls));self.assertEqual(0,self.invariants)

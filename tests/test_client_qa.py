@@ -47,6 +47,14 @@ class ClientQATests(unittest.TestCase):
             self.assertEqual(inventory,mixed['qa']['test_ids']);calls.clear()
             warm=run();self.assertEqual([],calls);self.assertTrue(warm['reused'])
             forced=run(force=True);self.assertEqual(['alpha','beta'],sorted(calls));self.assertEqual(2,forced['fresh_tests'])
+            grouped_calls=[]
+            def grouped(names, expected):
+                grouped_calls.append(names)
+                return {name:execute(name,expected[name]) for name in names}
+            grouped_result=qa_tasks.run(inventory,keys,store,COMMIT,grouped,workers=2,force=True,
+                minimum=2,batches=[['alpha','beta']])
+            self.assertEqual([['alpha','beta']],grouped_calls)
+            self.assertEqual(inventory,grouped_result['qa']['test_ids'])
             with self.assertRaises(ValueError):
                 run(inventory=['alpha.C.test_added','beta.C.test_b'])
 

@@ -46,6 +46,9 @@ class CoverageTests(unittest.TestCase):
             result=subprocess.run([sys.executable,qa.__file__,'--discover-only'],cwd=root,capture_output=True,text=True,check=True)
             report=json.loads(next(line[len(qa.MARKER):] for line in result.stdout.splitlines() if line.startswith(qa.MARKER)))
             self.assertEqual(['test_alpha.Tests.test_pass','test_beta.Tests.test_pass'],report['inventory'])
+            result=subprocess.run([sys.executable,qa.__file__,'--modules',json.dumps(['test_alpha','test_beta'])],cwd=root,capture_output=True,text=True,check=True)
+            report=json.loads(next(line[len(qa.MARKER):] for line in result.stdout.splitlines() if line.startswith(qa.MARKER)))
+            self.assertEqual(['test_alpha.Tests.test_pass','test_beta.Tests.test_pass'],report['test_ids'])
 
 
 if __name__=='__main__':unittest.main()

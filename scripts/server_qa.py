@@ -126,11 +126,13 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--worker',type=int,default=0);parser.add_argument('--workers',type=int,default=1)
     parser.add_argument('--directory',default='.')
     parser.add_argument('--discover-only',action='store_true');parser.add_argument('--module')
+    parser.add_argument('--modules',type=json.loads)
     args=parser.parse_args()
     started=time.monotonic()
-    if args.module:
+    if args.module or args.modules:
         sys.path.insert(0,str(Path(args.directory).resolve()))
-    suite=(unittest.defaultTestLoader.loadTestsFromName(args.module) if args.module else
+    suite=(unittest.defaultTestLoader.loadTestsFromNames(args.modules) if args.modules else
+           unittest.defaultTestLoader.loadTestsFromName(args.module) if args.module else
            unittest.defaultTestLoader.discover(args.directory,pattern='test_*.py'))
     tests=list(flatten(suite))
     inventory=sorted(test.id() for test in tests);groups=partition(inventory,args.workers)
@@ -153,7 +155,7 @@ def main():
             'errors':len(result.errors),'skipped':len(result.skipped),
             'expected_failures':len(result.expectedFailures),'unexpected_successes':len(result.unexpectedSuccesses),
             'passed':result.wasSuccessful() and not result.skipped and not result.expectedFailures}
-    if args.module:
+    if args.module or args.modules:
         report['test_ids']=report['executed'];report['elapsed_seconds']=round(time.monotonic()-started,6)
     print(MARKER+json.dumps(report,sort_keys=True),flush=True)
     return 0 if report['passed'] else 1

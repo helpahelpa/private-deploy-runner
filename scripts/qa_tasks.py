@@ -1,6 +1,8 @@
 """Sealed whole-module evidence; source subsets are physically enforced mounts."""
 import ast
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+import hashlib
 from pathlib import Path
 import os
 import re
@@ -13,6 +15,22 @@ import component_inputs
 BINARY_MODULES = frozenset(('test_tempering_build_adapters', 'test_patch_clone_coop',
     'test_tempering_ui', 'test_device_identifier', 'test_shared_activity_hp',
     'test_dev_shortcuts', 'test_tempering_diagnostic', 'test_local_accounts'))
+
+
+@lru_cache(maxsize=256)
+def imported_modules(content):
+    # The cache key is the actual bytes, never a timestamp or mutable file path.
+    # Return only import names, allowing the much larger AST to be released.
+    return tuple(imported for node in ast.walk(ast.parse(content))
+        for imported in ([alias.name for alias in node.names] if isinstance(node, ast.Import)
+                         else [node.module or ''] if isinstance(node, ast.ImportFrom) else []))
+
+
+def server_batches(inventory):
+    groups = [[] for _ in range(8)]
+    for module in modules(inventory):
+        groups[int(hashlib.sha256(module.encode()).hexdigest()[:8], 16) % len(groups)].append(module)
+    return [group for group in groups if group]
 
 
 def modules(inventory):
@@ -39,16 +57,12 @@ def closure(root, tree, seeds, owners):
         selected.add(name)
         if not name.endswith('.py'):
             continue
-        parsed = ast.parse((Path(root) / name).read_bytes(), filename=name)
-        for node in ast.walk(parsed):
-            imports = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
-                       else [node.module or ''] if isinstance(node, ast.ImportFrom) else [])
-            for imported in imports:
-                relative = imported.replace('.', '/')
-                for owner in owners:
-                    for candidate in (owner + '/' + relative + '.py', owner + '/' + relative + '/__init__.py'):
-                        if candidate in tree and candidate not in selected:
-                            pending.append(candidate)
+        for imported in imported_modules((Path(root) / name).read_bytes()):
+            relative = imported.replace('.', '/')
+            for owner in owners:
+                for candidate in (owner + '/' + relative + '.py', owner + '/' + relative + '/__init__.py'):
+                    if candidate in tree and candidate not in selected:
+                        pending.append(candidate)
     return selected
 
 
@@ -83,7 +97,7 @@ def materialize(source, destination, names):
 
 
 def run(inventory, keys, store, commit, execute, *, workers, force=False, weights=None,
-        required=(), minimum=1):
+        required=(), minimum=1, batches=None):
     expected = modules(inventory)
     if set(keys) != set(expected) or type(workers) is not int or not 1 <= workers <= 4:
         raise ValueError('Incomplete QA module plan')
@@ -101,19 +115,31 @@ def run(inventory, keys, store, commit, execute, *, workers, force=False, weight
         else:
             pending.append(module)
     weights = weights or {}
-    pending.sort(key=lambda name: (-weights.get(name, len(expected[name])), name))
-    def fresh(module):
-        command, log = execute(module, expected[module])
-        total = client_qa.validate_results([command], expected[module], len(expected[module]))
-        if total['test_ids'] != expected[module]:
-            raise ValueError('Fresh QA module inventory mismatch')
-        return module, ([command], log, commit, False)
+    if batches is not None:
+        flattened = [name for batch in batches for name in batch]
+        if sorted(flattened) != sorted(expected) or len(flattened) != len(set(flattened)):
+            raise ValueError('Incomplete QA execution groups')
+    planned = ([[name] for name in pending] if batches is None else
+               [[name for name in batch if name in pending] for batch in batches])
+    planned = sorted((batch for batch in planned if batch),
+        key=lambda batch: (-sum(weights.get(name, len(expected[name])) for name in batch), batch))
+    def fresh(batch):
+        values = ({batch[0]: execute(batch[0], expected[batch[0]])} if batches is None else
+                  execute(batch, {name: expected[name] for name in batch}))
+        if set(values) != set(batch):
+            raise ValueError('Incomplete QA execution group results')
+        results = {}
+        for module, (command, log) in values.items():
+            total = client_qa.validate_results([command], expected[module], len(expected[module]))
+            if total['test_ids'] != expected[module]:
+                raise ValueError('Fresh QA module inventory mismatch')
+            results[module] = ([command], log, commit, False)
+        return results
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='qa-module') as pool:
-        futures = [pool.submit(fresh, module) for module in pending]
+        futures = [pool.submit(fresh, batch) for batch in planned]
         try:
             for future in futures:
-                module, record = future.result()
-                records[module] = record
+                records.update(future.result())
         except BaseException:
             for future in futures:
                 future.cancel()

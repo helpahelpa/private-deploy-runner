@@ -442,10 +442,13 @@ def build(args):
             if len(inventory) < minimum_tests or not set(required_ids) <= set(inventory):
                 raise ValueError('Client module inventory is incomplete')
             views, keys = {}, {}
+            common = {name: value for name, value in qa_inputs.items() if name not in ('source', 'compiled')}
+            common_sha256 = client_qa.fingerprint(common)
             for module in module_ids:
                 readable = qa_tasks.client_inputs(source, qa_tree, module)
-                material = dict(qa_inputs, module=module, test_ids=module_ids[module],
-                                source={'source': readable, 'boundary': 'isolated client module'})
+                material = {'common_sha256': common_sha256, 'module': module, 'test_ids': module_ids[module],
+                            'source': {'source': readable, 'boundary': 'isolated client module'},
+                            'compiled': compiled_identity}
                 if module in qa_tasks.BINARY_MODULES:
                     material['source'] = {'boundary': 'isolated binary transform', 'source': readable}
                     # These compiled outputs are never mounted into source QA.

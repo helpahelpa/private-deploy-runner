@@ -26,17 +26,23 @@ invalidate their consumers. Fixture, harness, toolchain and immutable image inpu
 remain conservatively shared. Worker count is scheduling-only; mounted weights
 and executable scheduling/harness policy remain hashed.
 
-Server module mounts contain all shared production server modules and a transitive
-closure of imported test helpers, hiding unrelated test files. Shared runtime,
-static game data/text and the three reviewed client-side fixtures invalidate all
-server modules. A changed test only invalidates itself and its helper consumers.
+Server module keys use eight stable groups, assigned by a hash of the module
+name. Each group mount contains all shared production server modules and the
+transitive test-helper closure of that group; other tests are hidden. This lets
+missing modules in a group share one container startup and data import. A test
+edit invalidates its group and any groups importing it as a helper. Adding a
+module affects its assigned group without rebalancing every group. Receipts list
+each module's readable group explicitly. Shared runtime, static game data/text and
+the three reviewed client-side fixtures invalidate all server modules.
 A complete unchanged server can still reuse its image and prior suite receipt;
 its current discovered inventory is checked before acceptance.
 
 New, removed or renamed tests are handled through fresh discovery; readable file
 additions/deletions alter the affected module key. Unrecognized configuration and
 agent instructions stay conservative inputs. Source is read as data on the host;
-AST import inspection never imports source code. All source execution remains in
+AST import inspection never imports source code. Parsed import names are reused
+by exact file content, and common toolchain/configuration identities are hashed
+once before constructing individual module keys. All source execution remains in
 restricted containers without signing identities or cache mounts.
 
 Each sealed module entry records its input digest, exact passing IDs, private log
@@ -51,8 +57,9 @@ frozen-input checks; later packaging/deployment failures still fail the workflow
 Client modules stay intact so expensive class/module fixtures run once. A bounded
 pool of four isolated containers takes the longest estimated missing modules first,
 with deterministic name tie-breaking. Each container records complete module time,
-including setup and cleanup. Cached modules occupy no worker slot. Server module
-misses use a bounded pool of two; noncached standalone server/transport execution
+including setup and cleanup. Cached modules occupy no worker slot. Server groups
+use a bounded pool of two; each group executes only missing modules. Noncached
+standalone server/transport execution
 retains its complete-module partitioning.
 
 Update `scripts/client-qa-weights.json` from a successful forced run's

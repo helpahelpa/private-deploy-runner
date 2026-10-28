@@ -53,9 +53,11 @@ then bounded workers execute complete modules whose verified inputs changed.
 The trusted controller checks that their combined result includes
 every expected test exactly once with no skips, failures, or errors. Workers
 have separate temporary filesystems; failed workers fail the entire build.
-Client shards keep complete modules together and use recorded durations, including
+Client workers keep complete modules together and use recorded durations, including
 fixture setup and cleanup, rather than distributing equal numbers of methods.
-The three transport Python modules also run independently, alongside Node, on
+Server modules share eight stable isolated input groups to amortize startup;
+a test edit invalidates its group and helper consumers. The three transport
+Python modules also run independently, alongside Node, on
 every attempt. Phase and worker timings are included in the build logs.
 Logs identify cache hits, fresh test runs, worker totals, and the original tested
 commit. Reused evidence is never presented as newly executed tests.

@@ -321,35 +321,50 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
             require(qa['test_ids']==inventory,'Cached server inventory differs from fresh discovery')
         elif store:
             module_store=client_qa.Store(Path(component_cache)/'modules')
-            keys,views={},{}
-            for module in module_ids:
-                readable=qa_tasks.server_inputs(context,source_hashes,module)
-                views[module]=qa_tasks.materialize(context,work/('source-'+module),readable)
+            keys,views,module_group={},{},{}
+            batches=qa_tasks.server_batches(inventory)
+            common=dict(material_inputs,source_boundary={'fallback':component_inputs.fallback_source(
+                {n:':'.join(v) for n,v in objects.items()})})
+            common.pop('server');common.pop('workers')
+            common_sha256=client_qa.fingerprint(common)
+            for index,batch in enumerate(batches):
+                readable={name:value for module in batch
+                          for name,value in qa_tasks.server_inputs(context,source_hashes,module).items()}
+                views[index]=qa_tasks.materialize(context,work/('source-group-'+str(index)),readable)
                 for name in fixture_names:
                     if name.startswith('server/'):
-                        target=views[module]/name;target.parent.mkdir(parents=True,exist_ok=True)
+                        target=views[index]/name;target.parent.mkdir(parents=True,exist_ok=True)
                         os.link(fixtures/name,target)
-                identity=dict(material_inputs,server=readable,module=module,test_ids=module_ids[module],
-                    source_boundary={'fallback':component_inputs.fallback_source({n:':'.join(v) for n,v in objects.items()})})
-                identity.pop('workers')
-                keys[module]=client_qa.fingerprint(identity)
-            def execute_module(module,expected):
-                worker_root=work/('qa-'+module);worker_root.mkdir()
+                for module in batch:
+                    module_group[module]=index
+                    keys[module]=client_qa.fingerprint({'common_sha256':common_sha256,'server':readable,
+                        'module':module,'test_ids':module_ids[module],'readable_group':batch})
+            def execute_batch(batch,expected):
+                index=module_group[batch[0]]
+                worker_root=work/('qa-group-'+str(index));worker_root.mkdir()
                 command=list(cmd)
                 position=command.index('--workdir=/app/server')
-                command[position:position]=['--mount',f'type=bind,src={views[module]/"server"},dst=/app/server,readonly']
-                result=run_test_container(command+['/trusted/server_qa.py','--module',module],
-                    work=worker_root,timeout=1800,log=logs/('tests-'+module+'.log'))
+                command[position:position]=['--mount',f'type=bind,src={views[index]/"server"},dst=/app/server,readonly']
+                result=run_test_container(command+['/trusted/server_qa.py','--modules',json.dumps(batch)],
+                    work=worker_root,timeout=1800,log=logs/('tests-group-'+str(index)+'.log'))
                 reports=[json.loads(line[len(server_qa.MARKER):]) for line in result.decode().splitlines()
                          if line.startswith(server_qa.MARKER)]
-                require(len(reports)==1,'Missing or ambiguous server QA module evidence')
-                build_logs.emit('Server module '+module+': '+str(reports[0].get('tests'))
-                    +' tests freshly executed in '+str(reports[0].get('elapsed_seconds'))+' seconds.')
-                return {'command':['server module',module],'exit_code':0,'result':reports[0]},result
-            granular=qa_tasks.run(inventory,keys,module_store,commit,execute_module,
-                workers=qa_workers,force=force_full_qa,minimum=server_qa.MINIMUM_TESTS)
+                require(len(reports)==1,'Missing or ambiguous server QA group evidence')
+                report=reports[0];expected_ids=sorted(name for names in expected.values() for name in names)
+                command_report={'command':['server modules',*batch],'exit_code':0,'result':report}
+                totals=client_qa.validate_results([command_report],expected_ids,len(expected_ids))
+                require(totals['test_ids']==expected_ids,'Incomplete server QA execution group')
+                build_logs.emit('Server QA group '+str(index)+': '+str(len(batch))+' modules, '
+                    +str(report['tests'])+' tests freshly executed in '+str(report.get('elapsed_seconds'))+' seconds.')
+                return {module:({'command':['server modules',*batch],'exit_code':0,
+                    'result':dict(report,test_ids=sorted(name for name in report['test_ids']
+                        if name.rsplit('.',2)[0]==module),tests=len(expected[module]))},result) for module in batch}
+            granular=qa_tasks.run(inventory,keys,module_store,commit,execute_batch,
+                workers=qa_workers,force=force_full_qa,minimum=server_qa.MINIMUM_TESTS,batches=batches)
+            for item in granular['modules']:
+                item['readable_group']=batches[module_group[item['module']]]
             qa=dict(granular['qa'],workers=qa_workers,partition='verified whole modules',
-                    modules=granular['modules'],fresh_tests=granular['fresh_tests'])
+                    modules=granular['modules'],fresh_tests=granular['fresh_tests'],cache_groups=batches)
             (logs/'tests.log').write_bytes(b'\n'.join(granular['logs']));(logs/'tests.log').chmod(0o600)
             for item in granular['modules']:
                 if item['reused']:
