@@ -98,6 +98,18 @@ container is still healthy and still the expected image, and the job reports
 `server_restarted: false`. `status` therefore separates `managed_release` (the
 latest adopted commit) from `server_release` (the running image), and a later
 image-changing commit still performs the fenced handoff from that server release.
+
+Assets are served from a stable engine-owned directory, not from the release
+directory, so a client-only release changes no container mount. When only the
+assets change and the running world advertises `assets_reload` through its
+deployment control, the engine publishes them in place: files are replaced
+atomically, `update_config.json` and `apk-update.json` last, and only the current
+and previous releases keep their payloads so an in-flight download completes. The
+world re-reads the published configuration, so the new client version is served
+immediately; the job records `publication: assets` and `server_restarted: false`.
+A world that does not advertise reload support, or still serves its own release
+directory, keeps receiving the fenced handoff, and anything that changes the
+server image always does.
 Set `require_request_id_for_submit: true` in production broker configuration.
 Historical pre-upgrade workflows then fail closed instead of replaying a cached
 success; create a new run using the current workflow to get the new behavior.
