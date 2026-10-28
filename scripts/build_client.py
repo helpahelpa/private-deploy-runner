@@ -24,6 +24,7 @@ import native_apk
 import client_qa
 import component_inputs
 import git_source
+import qa_tasks
 import zipfile
 
 PRIVATE = Path(__file__).resolve().parents[1]
@@ -267,18 +268,23 @@ def verify_unchanged(pins):
         raise ValueError('Frozen private input changed during build')
 
 
-def qa_identity(tree, fixtures, inputs, vendor, config, compiled):
+def qa_material(tree, fixtures, inputs, vendor, config, compiled):
     """All admitted source and readable mount bytes, deliberately conservative."""
-    return client_qa.fingerprint({'schema': 2, 'source': component_inputs.identity(tree, 'client'), 'fixtures': fixtures,
+    return {'schema': 3, 'source': component_inputs.identity(tree, 'client'), 'fixtures': fixtures,
         'inputs': {name: digest(path) for name, path in inputs.items()},
         'trusted': client_qa.tree_identity(vendor),
         'controller': {name: {'sha256': digest(PRIVATE / 'scripts' / name),
                               'mode': (PRIVATE / 'scripts' / name).stat().st_mode & 0o777} for name in
-                       ('build_client.py', 'client_qa.py', 'client-qa-weights.json', 'component_inputs.py',
+                       ('build_client.py', 'client_qa.py', 'client-qa-weights.json', 'qa_tasks.py', 'component_inputs.py',
                         'git_source.py', 'build_logs.py', 'native_apk.py')},
         'toolchains': {tool['target']: client_qa.tree_identity(tool['path'])
                        for tool in config.get('toolchains', [])},
-        'config_sha256': client_qa.fingerprint(config), 'compiled': compiled})
+        'config_sha256': client_qa.fingerprint({name: value for name, value in config.items() if name != 'qa_workers'}),
+        'compiled': compiled}
+
+
+def qa_identity(tree, fixtures, inputs, vendor, config, compiled):
+    return client_qa.fingerprint(qa_material(tree, fixtures, inputs, vendor, config, compiled))
 
 
 def qa_commands(commands, workers):
@@ -318,7 +324,7 @@ def build(args):
     validate_build_mounts(config, inputs, vendor, credential)
     trusted_pins = {str(path): digest(path) for path in vendor.rglob('*') if path.is_file() and '__pycache__' not in path.parts}
     for path in (Path(__file__),Path(client_qa.__file__),Path(component_inputs.__file__),
-                 Path(git_source.__file__),client_qa.WEIGHTS):
+                 Path(git_source.__file__),Path(qa_tasks.__file__),client_qa.WEIGHTS):
         trusted_pins[str(path.resolve())] = digest(path)
     pins = {str(path): digest(path) for path in inputs.values()}
     if credential is not None:
@@ -411,13 +417,72 @@ def build(args):
         partitioned = qa_commands(commands, workers)
         identity_started = time.monotonic()
         compiled_identity = {'dex': digest(compile_out / 'classes.dex'), 'managed': digest(compiled_helper)}
-        qa_key = qa_identity(tree, fixture_pins, inputs, vendor, config, compiled_identity)
+        qa_inputs = qa_material(tree, fixture_pins, inputs, vendor, config, compiled_identity)
+        qa_key = client_qa.fingerprint(qa_inputs)
         build_logs.emit('Client broad QA input verification completed in ' + str(round(time.monotonic() - identity_started, 3)) + ' seconds.')
         qa_store = client_qa.Store(config.get('component_cache', str(Path(args.config).resolve().parent / 'client-qa-cache')))
-        cached_qa = client_qa.load_cached(qa_store, qa_key, force_full_qa)
+        granular = None
+        cached_qa = None
         required_ids = compile_config.get('required_test_ids', [])
         minimum_tests = compile_config.get('minimum_client_tests', 1)
-        if cached_qa:
+        if commands == [['python3', '/trusted/regression.py']]:
+            def invoke(command, mounted_source, overlays=()):
+                result = sandbox_run(container_command(config,
+                    [*common_mounts, (mounted_source, '/source'), *overlays, (test_config, '/trusted-test-config')],
+                    ['/trusted/test.py', json.dumps(command)], qa=True), timeout=config.get('test_timeout', 1200))
+                summary = client_qa.parse_result(result.stdout)
+                if result.returncode or summary.get('passed') is not True:
+                    private_diagnostics(result.stdout, result.stderr)
+                    raise ValueError('Client module discovery or regression failed')
+                return result, summary
+            discovery_command = commands[0] + ['--discover-only']
+            _, discovery = invoke(discovery_command, source)
+            inventory = discovery.get('inventory')
+            module_ids = qa_tasks.modules(inventory)
+            if len(inventory) < minimum_tests or not set(required_ids) <= set(inventory):
+                raise ValueError('Client module inventory is incomplete')
+            views, keys = {}, {}
+            for module in module_ids:
+                readable = qa_tasks.client_inputs(source, qa_tree, module)
+                material = dict(qa_inputs, module=module, test_ids=module_ids[module],
+                                source={'source': readable, 'boundary': 'isolated client module'})
+                if module in qa_tasks.BINARY_MODULES:
+                    material['source'] = {'boundary': 'isolated binary transform', 'source': readable}
+                    # These compiled outputs are never mounted into source QA.
+                    material['compiled'] = {}
+                    views[module] = (qa_tasks.materialize(source, stage / ('source-' + module),
+                                                         dict(readable, **fixture_pins)), [])
+                else:
+                    view = qa_tasks.materialize(source, stage / ('source-' + module),
+                        [name for name in readable if name.startswith('launch-build/')])
+                    views[module] = (source, [(view / 'launch-build', '/source/launch-build')])
+                keys[module] = client_qa.fingerprint(material)
+            def execute_module(module, expected):
+                command = commands[0] + ['--module', module]
+                result, summary = invoke(command, *views[module])
+                build_logs.emit('Client module ' + module + ': ' + str(summary.get('tests'))
+                    + ' tests freshly executed in ' + str(summary.get('elapsed_seconds')) + ' seconds.')
+                return ({'command': command, 'result': summary, 'exit_code': result.returncode,
+                    'stdout_sha256': hashlib.sha256(result.stdout).hexdigest(),
+                    'stderr_sha256': hashlib.sha256(result.stderr).hexdigest()},
+                    result.stdout + b'\nSTDERR\n' + result.stderr)
+            granular = qa_tasks.run(inventory, keys, qa_store, args.commit, execute_module,
+                workers=workers, force=force_full_qa,
+                weights=json.loads(client_qa.WEIGHTS.read_text())['seconds'], required=required_ids, minimum=minimum_tests)
+            tests, test_output = granular['commands'], granular['logs']
+            tested_source_commit = granular['tested_source_commit']
+            cached_qa = granular if granular['reused'] else None
+            for item in granular['modules']:
+                if item['reused']:
+                    build_logs.emit('Client module ' + item['module'] + ': cache hit; ' + str(item['tests'])
+                        + ' passed at ' + item['tested_source_commit'][:12] + ', verified inputs unchanged.')
+            build_logs.emit('Client module QA: ' + str(sum(item['reused'] for item in granular['modules']))
+                + '/' + str(len(module_ids)) + ' cache hits; ' + str(granular['fresh_tests']) + ' tests freshly executed.')
+        else:
+            cached_qa = client_qa.load_cached(qa_store, qa_key, force_full_qa)
+        if granular:
+            pass
+        elif cached_qa:
             build_logs.emit('Client broad QA cache hit; verified prior full-suite results reused; tests are not rerun.')
             tests, test_output = cached_qa['commands'], [cached_qa['log']]
             tested_source_commit = cached_qa['tested_source_commit']
@@ -453,10 +518,14 @@ def build(args):
                 raise ValueError('Frozen client QA dependencies changed during testing')
         qa_evidence = {'qa':qa_totals,'commands':tests,'input_sha256':qa_key,
                        'tested_source_commit':tested_source_commit,'reused':bool(cached_qa)}
+        if granular:
+            qa_evidence.update(modules=granular['modules'], fresh_tests=granular['fresh_tests'])
         evidence_path=output.parent/(output.name+'.qa.private.json')
         with os.fdopen(os.open(evidence_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:
             json.dump(qa_evidence,stream,sort_keys=True)
-        if not cached_qa:
+        if granular:
+            qa_tasks.publish(qa_store, granular, args.commit)
+        elif not cached_qa:
             with qa_store.locked():
                 qa_store.publish(qa_key, args.commit, tests, b'\n'.join(test_output), required_ids, minimum_tests)
         # Source tests only see read-only source, copied fixtures and toolchain mounts.
@@ -559,6 +628,8 @@ def build(args):
                    'qa': dict(qa_totals, input_sha256=qa_key, tested_source_commit=tested_source_commit,
                               current_source_commit=args.commit, reused=bool(cached_qa),
                               force_full_qa=force_full_qa, workers=workers,
+                              modules=granular['modules'] if granular else [],
+                              fresh_tests=granular['fresh_tests'] if granular else (0 if cached_qa else qa_totals['tests']),
                               boundary='isolated client inputs, shared server production, fixtures, harness, configuration, tools and compiled payload'),
                    'production_sources': prod, 'fixture_sha256': fixture_pins, 'commands': tests,
                    'verified_apk': {'input_sha256': apk_key, 'source_commit': apk_source_commit,

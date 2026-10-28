@@ -35,8 +35,9 @@ An explicit SHA must still be current `master`. Each GitHub run and retry gets
 its own numeric `run-id`/`run-attempt` identity, immutable logs, tested artifacts,
 and deployment receipt. Each attempt assembles a new release and replaces the
 server even if that commit is already active. By default, it can reuse verified
-whole client and server components when their complete input fingerprints match.
-There are no per-test or feature-level caches. Materially unchanged signed APKs
+client/server test modules when their isolated input fingerprints match.
+An unchanged complete server also reuses its verified image and suite evidence.
+Materially unchanged signed APKs
 remain byte-identical through the separate native APK cache.
 
 Select **Force full QA** to bypass both component test caches and rerun the full
@@ -47,8 +48,9 @@ update just to rerun tests. Transport checks and final deployment verification
 run on every attempt.
 
 Client QA is configured for four independent restricted containers, and server
-QA for two. Each worker discovers the full suite and executes its assigned
-tests. The trusted controller checks that their combined result includes
+QA for two. Every attempt discovers the full suite in an isolated container,
+then bounded workers execute complete modules whose verified inputs changed.
+The trusted controller checks that their combined result includes
 every expected test exactly once with no skips, failures, or errors. Workers
 have separate temporary filesystems; failed workers fail the entire build.
 Client shards keep complete modules together and use recorded durations, including
@@ -61,7 +63,9 @@ commit. Reused evidence is never presented as newly executed tests.
 The cache fingerprints include admitted source and tests, copied fixtures,
 trusted harness/build policy, pinned tools and images, and relevant private
 configuration. Client integration tests can read shared server code, so those
-inputs also invalidate the whole client cache. Cache entries are sealed only
+inputs invalidate the client modules that can read them. Eight expensive binary
+transform modules use narrower source mounts and can reuse evidence across shared
+server or Java/C# changes. Cache entries are sealed only
 after success, hash-checked before reuse, and kept outside source/test mounts.
 Corrupt evidence fails the build. Server admission invariants, artifact hashes,
 handoff, live replacement health, and the stopped predecessor are checked for
@@ -69,8 +73,9 @@ every deployment, including cache hits.
 
 Documentation and unrelated server-test/transport content are excluded from the
 client sandbox and its QA fingerprint. Server QA mounts only its three reviewed
-client-side fixture dependencies. New, deleted or renamed source paths invalidate
-both component caches; unknown configuration stays in both keys. See
+client-side fixture dependencies. New, deleted and renamed tests enter fresh
+discovery; changed production paths invalidate the modules that can read them.
+Unknown configuration stays in every module key. See
 [CI performance and input boundaries](docs/ci-performance.md) for maintenance,
 measurement and rollback instructions.
 

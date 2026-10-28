@@ -23,6 +23,8 @@ import build_logs
 import server_qa
 import component_inputs
 import git_source
+import client_qa
+import qa_tasks
 
 BASE = 'python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72'
 PROTOCOL = 'clone-coop-handoff-v1'
@@ -264,7 +266,8 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
                     'game_data':tree(data) if data else None,
                     'game_text':digest(text) if text else None,'base':BASE,'dockerfile':DOCKERFILE,
                     'compatibility':data_compatibility,'protocol':PROTOCOL,'workers':qa_workers,
-                    'engine':digest(__file__),'qa_runner':digest(server_qa.__file__),'build_logging':digest(build_logs.__file__),
+                    'engine':digest(__file__),'qa_runner':digest(server_qa.__file__),'module_cache':digest(qa_tasks.__file__),
+                    'evidence_validator':digest(client_qa.__file__),'build_logging':digest(build_logs.__file__),
                     'host_tools':{name:digest(Path(found).resolve()) if (found:=shutil.which(name)) else None for name in ('docker','openssl')},
                     'minimum_tests':server_qa.MINIMUM_TESTS}
         material_inputs=material();cache_key=server_qa.fingerprint(material_inputs)
@@ -300,8 +303,56 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
             cmd += ['--mount',f'type=bind,src={text},dst=/app/work/GameText_xored.txt,readonly']
         cmd += ['--mount',f'type=bind,src={Path(server_qa.__file__).resolve()},dst=/trusted/server_qa.py,readonly',
                 '--workdir=/app/server','--entrypoint=python',image]
+        granular=None
+        if store:
+            discovery_root=work/'qa-discovery';discovery_root.mkdir()
+            discovery=run_test_container(cmd+['/trusted/server_qa.py','--discover-only'],
+                work=discovery_root,timeout=1800,log=logs/'discovery.log')
+            reports=[json.loads(line[len(server_qa.MARKER):]) for line in discovery.decode().splitlines()
+                     if line.startswith(server_qa.MARKER)]
+            require(len(reports)==1 and reports[0].get('passed') is True,'Server module discovery failed')
+            inventory=reports[0]['inventory'];module_ids=qa_tasks.modules(inventory)
+            require(len(inventory)>=server_qa.MINIMUM_TESTS,'Server module inventory is incomplete')
         if cached:
-            qa=cached['qa'];shutil.copyfile(cached['path']/'tests.log',logs/'tests.log')
+            qa=dict(cached['qa'],fresh_tests=0)
+            qa['modules']=[dict(item,reused=True,reason='verified whole server inputs unchanged')
+                           for item in qa.get('modules',[])]
+            shutil.copyfile(cached['path']/'tests.log',logs/'tests.log')
+            require(qa['test_ids']==inventory,'Cached server inventory differs from fresh discovery')
+        elif store:
+            module_store=client_qa.Store(Path(component_cache)/'modules')
+            keys,views={},{}
+            for module in module_ids:
+                readable=qa_tasks.server_inputs(context,source_hashes,module)
+                views[module]=qa_tasks.materialize(context,work/('source-'+module),readable)
+                identity=dict(material_inputs,server=readable,module=module,test_ids=module_ids[module],
+                    source_boundary={'fallback':component_inputs.fallback_source({n:':'.join(v) for n,v in objects.items()})})
+                identity.pop('workers')
+                keys[module]=client_qa.fingerprint(identity)
+            def execute_module(module,expected):
+                worker_root=work/('qa-'+module);worker_root.mkdir()
+                command=list(cmd)
+                position=command.index('--workdir=/app/server')
+                command[position:position]=['--mount',f'type=bind,src={views[module]/"server"},dst=/app/server,readonly']
+                result=run_test_container(command+['/trusted/server_qa.py','--module',module],
+                    work=worker_root,timeout=1800,log=logs/('tests-'+module+'.log'))
+                reports=[json.loads(line[len(server_qa.MARKER):]) for line in result.decode().splitlines()
+                         if line.startswith(server_qa.MARKER)]
+                require(len(reports)==1,'Missing or ambiguous server QA module evidence')
+                build_logs.emit('Server module '+module+': '+str(reports[0].get('tests'))
+                    +' tests freshly executed in '+str(reports[0].get('elapsed_seconds'))+' seconds.')
+                return {'command':['server module',module],'exit_code':0,'result':reports[0]},result
+            granular=qa_tasks.run(inventory,keys,module_store,commit,execute_module,
+                workers=qa_workers,force=force_full_qa,minimum=server_qa.MINIMUM_TESTS)
+            qa=dict(granular['qa'],workers=qa_workers,partition='verified whole modules',
+                    modules=granular['modules'],fresh_tests=granular['fresh_tests'])
+            (logs/'tests.log').write_bytes(b'\n'.join(granular['logs']));(logs/'tests.log').chmod(0o600)
+            for item in granular['modules']:
+                if item['reused']:
+                    build_logs.emit('Server module '+item['module']+': cache hit; '+str(item['tests'])
+                        +' passed at '+item['tested_source_commit'][:12]+', verified inputs unchanged.')
+            build_logs.emit('Server module QA: '+str(sum(item['reused'] for item in granular['modules']))
+                +'/'+str(len(module_ids))+' cache hits; '+str(granular['fresh_tests'])+' tests freshly executed.')
         else:
             def worker(index):
                 worker_root=work/('qa-worker-'+str(index));worker_root.mkdir()
@@ -341,6 +392,7 @@ with tempfile.TemporaryDirectory() as t:
         verify_source(source, commit)
         require(all(digest(source/name) == value for name,value in source_hashes.items()), 'Source changed while building')
         require(material()==material_inputs,'Server QA material inputs changed during build')
+        if granular:qa_tasks.publish(module_store,granular,commit)
         artifact = work/'artifact'; artifact.mkdir()
         if cached:shutil.copyfile(cached['path']/'server-image.tar',artifact/'server-image.tar')
         else:run(['docker','image','save','--output',str(artifact/'server-image.tar'),image], timeout=1800)
@@ -348,7 +400,8 @@ with tempfile.TemporaryDirectory() as t:
             shutil.copyfile(logs/name,artifact/name); (artifact/name).chmod(0o600)
         write_json(artifact/'qa.json',qa)
         receipt = {'format':1,'commit':commit,'image':image,'base':BASE,'source_files':source_hashes,
-                   'tested_source_commit':cached['tested_source_commit'] if cached else commit,
+                   'tested_source_commit':cached['receipt'].get('tested_source_commit',cached['tested_source_commit']) if cached
+                       else granular['tested_source_commit'] if granular else commit,
                    'cache_provenance':{'component':'whole server','key':cache_key,'reused':bool(cached),'force_full_qa':force_full_qa},
                    'tests_passed':True,'trusted_invariants_passed':True,'invitation_gate':True,
                    'handoff_compatibility':PROTOCOL,'data_compatibility':data_compatibility,

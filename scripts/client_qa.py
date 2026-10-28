@@ -148,6 +148,7 @@ def validate_results(commands, required=(), minimum=1):
         result = command.get('result')
         if (command.get('exit_code') != 0 or not isinstance(result, dict) or result.get('passed') is not True
                 or any(result.get(key) != 0 for key in ('failures', 'errors', 'skipped'))
+                or any(result.get(key, 0) != 0 for key in ('expected_failures', 'unexpected_successes'))
                 or not isinstance(result.get('test_ids'), list)
                 or any(not isinstance(name, str) for name in result['test_ids'])
                 or result.get('tests') != len(result['test_ids'])):

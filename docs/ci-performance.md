@@ -7,48 +7,58 @@ restricted containers; the host only reads raw Git objects and runs trusted tool
 
 ## Input boundaries
 
-There are two QA result caches: whole client and whole server. No individual test
-results are cached. The signed native package has a separate material-input cache;
-changing QA or documentation must not create an Android update.
+QA evidence is cached by complete test module, with a separate whole-server image
+and suite cache and an independent material-input signed APK cache. No individual
+test method is cached or separated from its class/module fixtures. Every attempt
+rediscovers the complete client and server inventories inside restricted containers.
+The controller requires an exact, duplicate-free union of fresh and reused IDs,
+all required cases, and zero errors, failures, skips or expected failures.
 
-Client QA reads client source/tools/fixtures and shared production server code.
-Its invitation integration imports `server/test_account_auth.py`; that helper is
-also included. Other server tests, transport source and Markdown documentation
-are removed from its source mount and excluded from its result fingerprint.
-Agent instructions remain an input. These exclusions are enforced by the mount,
-not just omitted from a cache key. Updating a consumer test invalidates its entire
-component; a newly required missing input therefore fails before reusable evidence
-can be published.
+Client modules normally see shared production client/server inputs and their
+transitively imported test helpers. Unrelated client test modules are hidden by
+a read-only directory overlay. Eight reviewed expensive binary-transform modules
+(`qa_tasks.BINARY_MODULES`) instead receive only their Python import closure,
+retained work/output fixtures and conservative unknown configuration inputs.
+Their server and Java/C# sources are physically absent. An undeclared dynamic
+dependency therefore fails execution rather than silently escaping the key.
+New modules default to the broader client boundary. Imported helper-test changes
+invalidate their consumers. Fixture, harness, toolchain and immutable image inputs
+remain conservatively shared. Worker count is scheduling-only; mounted weights
+and executable scheduling/harness policy remain hashed.
 
-Server QA reads committed server modules/contracts, test JSON, static game tables,
-and three client-side fixture dependencies: `qa_stage2_combat_fixture.py`,
-`dev_tools.py`, and `screenshot_preview.py`. If those helpers acquire another local
-dependency, review it and add it to `component_inputs.SERVER_FIXTURES`. Do not mount
-a broader directory without adding all its readable inputs to the fingerprint.
+Server module mounts contain all shared production server modules and a transitive
+closure of imported test helpers, hiding unrelated test files. Shared runtime,
+static game data/text and the three reviewed client-side fixtures invalidate all
+server modules. A changed test only invalidates itself and its helper consumers.
+A complete unchanged server can still reuse its image and prior suite receipt;
+its current discovered inventory is checked before acceptance.
 
-Both fingerprints include the complete source path inventory. Additions, removals
-and renames conservatively invalidate both components, including new test files.
-Unrecognized roots and configuration remain shared inputs. Shared production,
-fixtures, policy, harness, toolchain, image and configuration changes invalidate
-the relevant whole component. Receipt provenance distinguishes reused evidence
-from fresh execution and records the original tested commit.
-Fresh client QA evidence is retained after the complete suite and frozen-input
-verification pass, before packaging. A later packaging failure still fails the
-workflow; retrying can reuse the verified QA while repeating packaging and its
-artifact checks.
+New, removed or renamed tests are handled through fresh discovery; readable file
+additions/deletions alter the affected module key. Unrecognized configuration and
+agent instructions stay conservative inputs. Source is read as data on the host;
+AST import inspection never imports source code. All source execution remains in
+restricted containers without signing identities or cache mounts.
+
+Each sealed module entry records its input digest, exact passing IDs, private log
+and original tested commit. Mixed-cache receipts retain provenance per module,
+not an invented single original commit. Logs show fresh modules, reused modules
+and fresh test counts. Cache corruption, missing/duplicate IDs, changed discovery,
+failed tests or failed cleanup fail the build. Evidence is published only after
+frozen-input checks; later packaging/deployment failures still fail the workflow.
 
 ## Scheduling and measurements
 
-Client modules stay intact so expensive class/module fixtures run once. The
-trusted scheduler assigns the longest estimated modules first to the least loaded
-of four workers, with deterministic name/index tie-breaking. Unknown modules get
-a conservative estimate. Each worker records complete module wall time, including
-setup and cleanup; the controller checks identical discovery and exact coverage.
+Client modules stay intact so expensive class/module fixtures run once. A bounded
+pool of four isolated containers takes the longest estimated missing modules first,
+with deterministic name tie-breaking. Each container records complete module time,
+including setup and cleanup. Cached modules occupy no worker slot. Server module
+misses use a bounded pool of two; noncached standalone server/transport execution
+retains its complete-module partitioning.
 
 Update `scripts/client-qa-weights.json` from a successful forced run's
 `client-tests.json` command results (`module_seconds`). Keep weights positive and
 finite; timings guide scheduling only and never determine test selection. The
-weights and scheduler are included in the QA identity. Avoid more workers until
+weights and executable scheduler are included in the QA identity. Avoid more workers until
 resource measurements justify their repeated startup and memory cost.
 
 Server QA uses two workers with complete modules. Transport uses three capped
@@ -76,8 +86,8 @@ measure cache overhead. Do not add concurrent benchmark load to a comparison run
 
 ## Full validation and rollback
 
-Use the existing **Force full QA** workflow option to bypass both component result
-caches. It still preserves an unchanged signed APK. Transport and live deployment
+Use the existing **Force full QA** workflow option to bypass every module and whole-component result
+cache. It still preserves an unchanged signed APK. Transport and live deployment
 checks always run fresh. Corrupt cache evidence fails closed.
 
 For an input-boundary regression, force full QA and restore the last reviewed

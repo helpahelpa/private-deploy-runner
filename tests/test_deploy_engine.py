@@ -157,6 +157,7 @@ class ServerComponentTests(unittest.TestCase):
         self.repo=self.root/'source';(self.repo/'server').mkdir(parents=True);(self.repo/'launch-build').mkdir()
         (self.repo/'server/multiplayer_server.py').write_text('# Synthetic trusted fixture only\n')
         (self.repo/'server/test_alpha.py').write_text('# Synthetic test fixture\n')
+        (self.repo/'server/test_beta.py').write_text('# Independent synthetic test fixture\n')
         (self.repo/'launch-build/qa_stage2_combat_fixture.py').write_text('# Mounted fixture\n')
         (self.repo/'launch-build/client_only.py').write_text('# Client component only\n')
         (self.repo/'README.md').write_text('first')
@@ -187,7 +188,17 @@ class ServerComponentTests(unittest.TestCase):
     def container(self,args,*,work,timeout,log):
         if '-c' in args:
             self.invariants+=1;Path(log).write_text('fresh invariant fixture pass\n');return b''
-        self.calls.append((tuple(args),str(work)));self.barrier.wait(3)
+        if '--discover-only' in args:
+            output=(e.server_qa.MARKER+json.dumps({'passed':True,'inventory':
+                ['test_alpha.A.test_a','test_beta.B.test_b']})+'\n').encode()
+            Path(log).write_bytes(output);return output
+        self.calls.append((tuple(args),str(work)))
+        if '--module' in args:
+            module=args[args.index('--module')+1]
+            selected=['test_alpha.A.test_a'] if module=='test_alpha' else ['test_beta.B.test_b']
+            report=dict(test_ids=selected,tests=len(selected),passed=True,failures=0,errors=0,skipped=0)
+            output=(e.server_qa.MARKER+json.dumps(report)+'\n').encode();Path(log).write_bytes(output);return output
+        self.barrier.wait(3)
         index=int(args[args.index('--worker')+1]);workers=int(args[args.index('--workers')+1])
         inventory=['test_alpha.A.test_a','test_beta.B.test_b'];selected=e.server_qa.partition(inventory,workers)[index]
         report=dict(worker=index,workers=workers,inventory=inventory,selected=selected,executed=selected,
@@ -228,6 +239,18 @@ class ServerComponentTests(unittest.TestCase):
         self.build('changed-fixture')
         self.assertEqual((8,4,4),(len(self.calls),self.invariants,self.builds))
 
+    def test_changed_test_module_reuses_independent_evidence_but_shared_runtime_runs_both(self):
+        self.build('first')
+        (self.repo/'server/test_alpha.py').write_text('# Changed alpha behavior\n')
+        self.commit=self.commit_source('change one module');changed=self.build('changed-one')
+        qa=json.loads((self.root/'changed-one/qa.json').read_text())
+        self.assertEqual(3,len(self.calls));self.assertFalse(changed['cache_provenance']['reused'])
+        self.assertEqual([('test_alpha',False),('test_beta',True)],[(item['module'],item['reused']) for item in qa['modules']])
+        self.assertEqual(1,qa['fresh_tests']);self.assertEqual(['test_alpha.A.test_a','test_beta.B.test_b'],qa['test_ids'])
+        (self.repo/'server/multiplayer_server.py').write_text('# Shared runtime changed\n')
+        self.commit=self.commit_source('shared runtime');self.build('changed-runtime')
+        self.assertEqual(5,len(self.calls));self.assertEqual(3,self.invariants)
+
     def test_corrupt_cache_fails_closed_and_force_full_qa_publishes_new_immutable_generation(self):
         info=self.build('first');key=info['cache_provenance']['key']
         stored=e.server_qa.Store(self.cache).lookup(key);old=stored['path']
@@ -241,7 +264,7 @@ class ServerComponentTests(unittest.TestCase):
     def test_worker_cleanup_failure_cannot_publish_any_component(self):
         def failed(args,**kwargs):
             result=self.container(args,**kwargs)
-            if '--worker' in args and args[args.index('--worker')+1]=='0':raise e.DeploymentError('Synthetic worker cleanup failure')
+            if '--module' in args and args[args.index('--module')+1]=='test_alpha':raise e.DeploymentError('Synthetic worker cleanup failure')
             return result
         with patch.object(e,'run_test_container',side_effect=failed),self.assertRaises(e.DeploymentError):self.build('failed')
         self.assertEqual(2,len(self.calls));self.assertEqual(0,self.invariants)

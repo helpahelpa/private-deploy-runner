@@ -11,6 +11,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import client_qa as qa
+import qa_tasks
 
 COMMIT = 'a' * 40
 KEY = 'b' * 64
@@ -26,6 +27,29 @@ def commands(count=3):
 
 
 class ClientQATests(unittest.TestCase):
+    def test_module_cache_reuses_only_matching_evidence_and_full_run_executes_every_module(self):
+        inventory=['alpha.C.test_a','beta.C.test_b'];calls=[]
+        def execute(module, expected):
+            calls.append(module)
+            return ({'exit_code':0,'result':{'passed':True,'tests':1,'test_ids':expected,
+                'failures':0,'errors':0,'skipped':0}},module.encode())
+        with tempfile.TemporaryDirectory() as directory:
+            store=qa.Store(directory);keys={'alpha':'a'*64,'beta':'b'*64}
+            def run(commit=COMMIT,force=False,inventory=inventory):
+                return qa_tasks.run(inventory,keys,store,commit,execute,workers=2,force=force,minimum=2)
+            first=run();qa_tasks.publish(store,first,COMMIT)
+            self.assertEqual(['alpha','beta'],sorted(calls));calls.clear()
+            keys['alpha']='c'*64
+            mixed=run('d'*40);qa_tasks.publish(store,mixed,'d'*40)
+            self.assertEqual(['alpha'],calls);self.assertEqual(1,mixed['fresh_tests'])
+            self.assertEqual([('alpha',False,'d'*40),('beta',True,COMMIT)],
+                [(item['module'],item['reused'],item['tested_source_commit']) for item in mixed['modules']])
+            self.assertEqual(inventory,mixed['qa']['test_ids']);calls.clear()
+            warm=run();self.assertEqual([],calls);self.assertTrue(warm['reused'])
+            forced=run(force=True);self.assertEqual(['alpha','beta'],sorted(calls));self.assertEqual(2,forced['fresh_tests'])
+            with self.assertRaises(ValueError):
+                run(inventory=['alpha.C.test_added','beta.C.test_b'])
+
     def test_single_trusted_summary_is_required(self):
         marker = b'PRIVATE_CLIENT_TEST_RESULT={"passed":true}\n'
         self.assertEqual(qa.parse_result(b'ordinary output\n' + marker), {'passed': True})
