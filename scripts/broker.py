@@ -810,7 +810,7 @@ class Broker:
                 # adopted in place; changed assets alone are published onto the
                 # running world when it can reload them. Only a new image restarts it.
                 if self.operations.release_is_active(release):
-                    proof=self.operations.publish_unchanged(sha,release);restarted=False
+                    proof=self.operations.publish_unchanged(sha,release);restarted=False;published='unchanged'
                 elif self.operations.assets_can_publish(release):
                     proof=self.operations.publish_assets(sha,release);restarted=False;published='assets'
                 else:
