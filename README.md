@@ -337,11 +337,15 @@ The 2026-10-28 test-quality audit removed 107 weak or duplicate tests: 50 client
 private-cache, and collaborator-call assertions from 44 otherwise useful server
 tests. A follow-up independent Sol/Opus review removed three proven duplicates
 and refined weak assertions while retaining the important scenarios. The retained
-deployment suites contain 223 client, 740 server, 59 Python
+deployment suites contain 219 client, 740 server, 59 Python
 transport, 23 Worker, and 239 controller tests. The separate 11-case portable
 release suite is retained. Test baselines reflect this explicit curation;
 zero-skip source QA, complete worker coverage, account/session admission and live
 replacement verification remain required.
+
+The user subsequently requested removing four maintained-APK compatibility and
+binary-preservation cases from that retained client inventory. Those cases and
+their unused setup were removed; they are not skipped or replaced by mocks.
 
 Tests should exercise public behavior using independent expected outcomes.
 Source-substring/AST snapshots, private implementation choreography, internal
