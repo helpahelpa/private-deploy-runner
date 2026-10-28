@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 import uuid
@@ -105,6 +106,47 @@ class BrokerPublicationTests(unittest.TestCase):
         self.assertEqual([], self.ops.publications)
         self.assertIs(True, job['server_restarted'])
         self.assertEqual([('replacement', True)], self.ops.verifications)
+
+
+class ClientMaterialTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.active = self.root / 'active'
+        self.client = self.root / 'client'
+        self.pack = 'Android_90/UpdateRoot/IncrementPack/%s/Client/GameRes/Resources/Client.bytes.bytes'
+        for base, version, payload in ((self.active, '4.2.0.76', b'increment'),
+                                       (self.client / 'assets', '4.2.0.99', b'increment')):
+            path = base / (self.pack % version)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        (self.active / 'update_config.json').write_text('{"server_versions": {"Android_90": "4.2.0.76"}}')
+        (self.active / 'client.apk').write_bytes(b'apk')
+        self.manifest = {'apk_sha256': e.digest(self.active / 'client.apk'),
+                         'asset_files': {self.pack % '4.2.0.99': 'digest'}}
+        token = self.root / 'token'
+        token.write_text(TOKEN)
+        token.chmod(0o600)
+        self.operations = types.SimpleNamespace(c={'publish_apk': True})
+
+    def unchanged(self):
+        return broker.Operations.client_material_unchanged(self.operations, self.active, self.client, self.manifest)
+
+    def test_identical_client_payload_reuses_the_published_version(self):
+        self.assertTrue(self.unchanged())
+
+    def test_changed_pack_payload_publishes_a_new_version(self):
+        (self.client / 'assets' / (self.pack % '4.2.0.99')).write_bytes(b'changed')
+        self.assertFalse(self.unchanged())
+
+    def test_changed_apk_publishes_a_new_version(self):
+        self.manifest = dict(self.manifest, apk_sha256='0' * 64)
+        self.assertFalse(self.unchanged())
+
+    def test_missing_published_apk_publishes_a_new_version(self):
+        (self.active / 'client.apk').unlink()
+        self.assertFalse(self.unchanged())
 
 
 class EnginePublicationTests(unittest.TestCase):

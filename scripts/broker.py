@@ -340,6 +340,27 @@ class Operations:
         with public_logging(self.c, job_key(sha, request_id)):
             return self._build(sha, version, stage, request_id=request_id, force_full_qa=force_full_qa)
 
+    def client_material_unchanged(self, active_assets, client, manifest):
+        """True when the built client publishes exactly what the active release already serves."""
+        active_assets = Path(active_assets)
+        if not (active_assets / 'update_config.json').is_file():
+            return False
+        if self.c.get('publish_apk', True):
+            published = active_assets / 'client.apk'
+            if not published.is_file() or engine.digest(published) != manifest['apk_sha256']:
+                return False
+        versioned = [name for name in manifest['asset_files'] if '/IncrementPack/' in name]
+        if not versioned:
+            return False
+        for name in versioned:
+            parts = PurePosixPath(name).parts
+            marker = parts.index('IncrementPack')
+            pattern = '/'.join(parts[:marker + 1]) + '/*/' + '/'.join(parts[marker + 2:])
+            peers = [path for path in sorted(active_assets.glob(pattern)) if path.is_file()]
+            if not peers or engine.digest(peers[0]) != engine.digest(client / 'assets' / name):
+                return False
+        return True
+
     def _build(self, sha, version, stage, *, request_id=None, force_full_qa=False):
         require(type(force_full_qa) is bool)
         key = job_key(sha, request_id)
@@ -396,6 +417,27 @@ class Operations:
         verify_apk_update(client, manifest)
         stage("assemble")
         assets = scratch / "assets"
+        active_assets = None
+        try:
+            active_assets = Path(engine.Engine(self.c['engine_config']).active()['release_path']) / 'assets'
+        except Exception:
+            active_assets = None
+        if active_assets is not None and self.client_material_unchanged(active_assets, client, manifest):
+            # Nothing the client serves changed: publish the active assets as they
+            # are instead of minting a new version, so no world restart is needed.
+            build_logs.emit('Client material is unchanged; the served assets are reused without a new version.')
+            shutil.copytree(active_assets, assets)
+            provenance = scratch / "provenance.json"
+            engine.write_json(provenance, {"commit": sha, "tested": True, "files": engine.tree(assets),
+                                           "tests_receipt_sha256": engine.digest(receipt)})
+            engine.assemble(scratch / "server", assets, provenance, receipt, scratch / "release")
+            engine.write_json(scratch / "receipt.json", {"sha": sha, "request_id": request_id,
+                                                         "version": version, "files": engine.tree(scratch)})
+            destination = builds / key
+            require(not destination.exists())
+            os.replace(scratch, destination)
+            build_logs.emit("Signed client and matching server/assets verified and assembled successfully.")
+            return destination / "release"
         base = self.c.get("static_assets")
         if base:
             files = engine.tree(base["path"])
