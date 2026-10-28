@@ -151,3 +151,51 @@ queue time is separate. They are not guarantees for future changes or cache stat
 - [Previous fresh baseline](https://github.com/helpahelpa/private-deploy-runner/actions/runs/40609700011)
 - [Optimized forced deployment](https://github.com/helpahelpa/private-deploy-runner/actions/runs/40613397366)
 - [Optimized warm deployment](https://github.com/helpahelpa/private-deploy-runner/actions/runs/40614243843)
+
+## Fine-grained cache acceptance
+
+The module/artifact implementation was accepted with a real forced deployment:
+all 1,041 source checks executed fresh, all 46 client and 79 server module
+receipts matched fresh discovery, and the healthy replacement stopped its
+predecessor. The job took **5m47s**. This is 25 seconds slower than the earlier
+5m22s whole-component forced run; finer input isolation adds cold-run overhead.
+The benefit is retaining verified work across partial changes, rather than
+claiming a faster forced suite.
+
+The signed APK stayed byte-identical at version 71; Main/DEV preserved files and
+Main connection preferences remained unchanged. The two binary outputs were
+computed on the first deployment and are independently reusable afterward.
+A separate real-transform probe measured their combined computation at about
+7.5 seconds and verified-cache retrieval at about 0.09 seconds, with identical
+output bytes. Those are transform timings, not deployment wall times.
+
+- [Fine-grained forced deployment](https://github.com/helpahelpa/private-deploy-runner/actions/runs/40623991221)
+
+The subsequent unchanged deployment took **1m14s**, versus **1m24s** for the
+previous whole-component warm run (about 12% shorter). It reused all 46 client
+and 79 server module receipts and both binary transforms, executed all 82
+transport checks fresh, and completed a real verified replacement. Client
+preparation, validation and packaging took 34.4 seconds, compared with 46.3
+seconds in the earlier warm run. Fresh discovery and transport/live checks
+remain part of that wall time. Versioned asset paths were regenerated for the
+new allocation; binary payload checksums and the signed APK stayed identical.
+
+- [Fine-grained warm deployment](https://github.com/helpahelpa/private-deploy-runner/actions/runs/40624598580)
+
+Disposable source-input probes then exercised partial invalidation against the
+populated caches. Editing one client test module executed only its two tests and
+reused the other 45 modules. Editing one server test module executed its stable
+group of 10 modules (106 tests), reusing the remaining 69 modules. Both receipts
+still covered the exact full inventories of 219 and 740 tests. These probes used
+isolated source commits and did not publish a deployment.
+
+Additional input-projection checks verified that shared server and Java changes
+retain all eight independent binary QA modules, a binary helper change invalidates
+its consumers, and unknown configuration or agent-instruction changes invalidate
+all client modules. The controller regression run passed 237 checks with five
+existing optional-environment skips. Source QA acceptance had zero skips.
+
+A deliberate failing assertion in the changed client module made the build fail,
+published no new QA evidence or release output, and left Main and the native
+version counter unchanged. Cache reuse did not mask the failure. Public workflow
+logs were also checked for configured secret and machine-identity literals.
