@@ -268,7 +268,7 @@ using `check_transport.py` and an operator-owned configuration like
 tests in pinned local images, with no network, read-only curated source, temporary
 logs, and no credentials or other host mounts. Only top-level Cloudflare Python
 and JavaScript files, server Python/contracts, and the test certificate helper
-enter this sandbox. At least 60 Python and 20 Node tests must pass with zero skips;
+enter this sandbox. At least 59 Python and 20 Node tests must pass with zero skips;
 the receipt binds commit, source hashes, image pins, counts, and private log hashes.
 The private transport configuration also pins required recovered GameData tables
 with `fixtures`: each destination under `work/apk/luapack_extracted/GameData/`

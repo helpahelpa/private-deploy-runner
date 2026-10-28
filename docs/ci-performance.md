@@ -58,8 +58,8 @@ temporary filesystems and the same network/privilege restrictions. Every worker
 is joined and cleaned up before a failure can return. All Python transport tests
 must appear exactly once, meet the total floor, and have zero failures or skips.
 Client workers are capped at two CPUs and 2 GiB each; their combined memory cap
-is 8 GiB. The four-worker setting was selected for a 16-CPU host. Keep production
-and server/transport QA headroom when adapting it to a smaller machine.
+is 8 GiB. Choose the worker count after measuring available headroom for production
+and server/transport QA.
 
 Source preparation uses bounded `git cat-file --batch-check` and `--batch` reads.
 Object kind, identity, declared size, returned framing and complete output are
@@ -85,3 +85,23 @@ boundary/sandbox policy together. For scheduling changes, revert the scheduler
 and weights together. Reverting CI policy does not authorize restoring player
 data or older production source. Deployments continue using the normal fenced
 handoff and persistent data volume.
+
+## Verified deployment results
+
+The 2026-10-28 forced run completed in **5m22s**, compared with **7m50s** for the
+previous fresh run with the same 1,041 source-check inventory (about 32% shorter).
+It executed all 219 client, 740 server, 59 Python transport and 23 Worker checks.
+The slowest client worker fell from 333.5 to 199.9 seconds. Fresh transport checks
+finished in 16.1 seconds, retaining the full 169 MiB streaming scenario.
+
+The subsequent warm run completed in **1m24s**, reusing verified whole-client and
+whole-server QA evidence while executing all 82 transport checks fresh. Both runs
+performed a real container replacement, verified a healthy successor and stopped
+predecessor, preserved player data, and reused the exact signed APK.
+
+These are individual observed job durations, including deployment verification;
+queue time is separate. They are not guarantees for future changes or cache states.
+
+- [Previous fresh baseline](https://github.com/helpahelpa/private-deploy-runner/actions/runs/40609700011)
+- [Optimized forced deployment](https://github.com/helpahelpa/private-deploy-runner/actions/runs/40613397366)
+- [Optimized warm deployment](https://github.com/helpahelpa/private-deploy-runner/actions/runs/40614243843)
