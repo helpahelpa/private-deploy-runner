@@ -105,7 +105,8 @@ class TransportTests(unittest.TestCase):
     def test_config_rejects_commands_mutable_images_and_lowered_baselines(self):
         path = self.root / "config.json"
         for changes in ({"command": ["id"]}, {"source": "/private"}, {"node_image": "node:24"},
-                        {"minimum_python_tests": 58}, {"minimum_node_tests": 19}):
+                        {"minimum_python_tests": 58}, {"minimum_node_tests": 19},
+                        {"python_workers":0}, {"python_workers":4}, {"python_workers":True}):
             path.write_text(json.dumps(dict(self.config, **changes)))
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 gate.config_read(path)
@@ -120,6 +121,13 @@ class TransportTests(unittest.TestCase):
             if argv[0] != "docker":
                 return real_run(argv, **kwargs)
             calls.append(argv)
+            if '/trusted/server_qa.py' in argv:
+                index=int(argv[argv.index('--worker')+1]);workers=int(argv[argv.index('--workers')+1])
+                inventory=[f'test_{module}.Case.test_{case:02}' for module in ('alpha','beta','gamma') for case in range(20)]
+                selected=gate.server_qa.partition(inventory,workers)[index]
+                report=dict(worker=index,workers=workers,inventory=inventory,selected=selected,executed=selected,
+                            tests=len(selected),passed=True,failures=0,errors=0,skipped=0)
+                return subprocess.CompletedProcess(argv,0,(gate.server_qa.MARKER+json.dumps(report)+'\n').encode(),b'')
             return subprocess.CompletedProcess(argv, 0, b"" if "--entrypoint=python3" in argv else NODE_OK,
                                                PYTHON_OK if "--entrypoint=python3" in argv else b"")
         with patch.object(gate.subprocess, "run", side_effect=run):
@@ -134,6 +142,14 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(log.stat().st_mode & 0o777, 0o600)
             self.assertEqual(receipt["results"][language]["log_sha256"], hashlib.sha256(log.read_bytes()).hexdigest())
         self.assertTrue((output / "transport.json").exists())
+        calls.clear()
+        with patch.object(gate.subprocess, "run", side_effect=run):
+            parallel=gate.check(dict(self.config,python_workers=3),source,commit,self.root/'parallel')
+        self.assertEqual(parallel['results']['python']['tests'],60)
+        self.assertEqual(parallel['results']['python']['workers'],3)
+        self.assertEqual(len(parallel['results']['python']['test_ids']),60)
+        self.assertEqual(len([argv for argv in calls if argv[:2]==['docker','run']]),4)
+        self.assertEqual(len([argv for argv in calls if argv[:2]==['docker','rm']]),4)
 
     def test_failed_container_keeps_private_log_and_never_writes_passed_receipt(self):
         source = self.repository()
@@ -185,10 +201,12 @@ class TransportTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         with patch.object(gate.subprocess, "run", side_effect=run), self.assertRaises(ValueError):
             gate.check(self.config, source, commit, output)
-        self.assertEqual(len(calls), 2)
-        name = calls[0][calls[0].index("--name") + 1]
-        self.assertEqual(calls[1], ["docker", "rm", "--force", name])
-        self.assertTrue(name.startswith("private-private-server-qa-"))
+        runs=[call for call in calls if call[:2]==['docker','run']]
+        cleanups=[call for call in calls if call[:2]==['docker','rm']]
+        names={call[call.index('--name')+1] for call in runs}
+        self.assertEqual(len(names),2)
+        self.assertEqual({call[-1] for call in cleanups},names)
+        self.assertTrue(all(name.startswith('private-private-server-qa-') for name in names))
         self.assertFalse((output / "transport.json").exists())
         self.assertTrue((output / "python.private.log").exists())
 

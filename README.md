@@ -46,11 +46,15 @@ Forced QA still reuses an unchanged signed APK and does not create an Android
 update just to rerun tests. Transport checks and final deployment verification
 run on every attempt.
 
-Client QA is configured for three independent restricted containers, and server
+Client QA is configured for four independent restricted containers, and server
 QA for two. Each worker discovers the full suite and executes its assigned
 tests. The trusted controller checks that their combined result includes
 every expected test exactly once with no skips, failures, or errors. Workers
 have separate temporary filesystems; failed workers fail the entire build.
+Client shards keep complete modules together and use recorded durations, including
+fixture setup and cleanup, rather than distributing equal numbers of methods.
+The three transport Python modules also run independently, alongside Node, on
+every attempt. Phase and worker timings are included in the build logs.
 Logs identify cache hits, fresh test runs, worker totals, and the original tested
 commit. Reused evidence is never presented as newly executed tests.
 
@@ -62,6 +66,13 @@ after success, hash-checked before reuse, and kept outside source/test mounts.
 Corrupt evidence fails the build. Server admission invariants, artifact hashes,
 handoff, live replacement health, and the stopped predecessor are checked for
 every deployment, including cache hits.
+
+Documentation and unrelated server-test/transport content are excluded from the
+client sandbox and its QA fingerprint. Server QA mounts only its three reviewed
+client-side fixture dependencies. New, deleted or renamed source paths invalidate
+both component caches; unknown configuration stays in both keys. See
+[CI performance and input boundaries](docs/ci-performance.md) for maintenance,
+measurement and rollback instructions.
 
 The workflow stays running until registry synchronization and independent live
 replacement verification finish. Build/test errors, failed handoff, unhealthy

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check exact-commit relay transports in fixed isolated Python/Node containers."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -8,8 +9,11 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tempfile
+import time
 
 import deploy_engine as engine
+import git_source
+import server_qa
 
 IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -25,7 +29,8 @@ def require(value):
 def config_read(path):
     value = json.loads(Path(path).read_text())
     require(isinstance(value, dict) and set(value) <= {
-        "python_image", "node_image", "minimum_python_tests", "minimum_node_tests", "fixtures"})
+        "python_image", "node_image", "minimum_python_tests", "minimum_node_tests", "fixtures", "python_workers"})
+    require(type(value.get('python_workers',1)) is int and 1 <= value.get('python_workers',1) <= 3)
     for key in ("python_image", "node_image"):
         require(isinstance(value.get(key), str) and IMAGE.fullmatch(value[key]))
     for key, floor in (("minimum_python_tests", PYTHON_FLOOR), ("minimum_node_tests", NODE_FLOOR)):
@@ -83,7 +88,7 @@ def snapshot(source, commit, destination):
     require(git(source, "rev-parse", "HEAD").decode().strip() == commit)
     require(not git(source, "status", "--porcelain", "--untracked-files=no").strip())
     files = {}
-    total = 0
+    admitted = []
     for entry in git(source, "ls-tree", "-rz", "--full-tree", commit).split(b"\0"):
         if not entry:
             continue
@@ -95,10 +100,8 @@ def snapshot(source, commit, destination):
         mode, kind, oid = header.split()
         require(mode in (b"100644", b"100755") and kind == b"blob"
                 and not path.is_absolute() and ".." not in path.parts and "\\" not in name)
-        size = int(git(source, "cat-file", "-s", oid.decode()))
-        total += size
-        require(size <= 32 * 1024 * 1024 and total <= 128 * 1024 * 1024)
-        data = git(source, "cat-file", "blob", oid.decode())
+        admitted.append((name,oid.decode()))
+    for (name,_),data in zip(admitted,git_source.read_blobs(source,[oid for _,oid in admitted],maximum_total=128*1024*1024)):
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
@@ -114,7 +117,7 @@ def snapshot(source, commit, destination):
     return files
 
 
-def container(image, source, language):
+def container(image, source, language, worker=None, workers=1):
     require(isinstance(image, str) and IMAGE.fullmatch(image))
     require(language in ("python", "node"))
     source = Path(source).resolve()
@@ -127,6 +130,15 @@ def container(image, source, language):
              "--tmpfs=/source/server/logs:rw,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=0700",
              "--mount", f"type=bind,src={source},dst=/source,readonly"]
     if language == "python":
+        if worker is not None:
+            require(type(workers) is int and 1 <= workers <= 3 and type(worker) is int and 0 <= worker < workers)
+            # Streaming TLS fixtures need little RAM; reserve headroom for the
+            # four client and two server workers on the same machine.
+            flags[flags.index('--memory=2g')] = '--memory=1g'
+            flags[flags.index('--cpus=2')] = '--cpus=1'
+            flags += ['--mount',f'type=bind,src={Path(server_qa.__file__).resolve()},dst=/trusted/server_qa.py,readonly']
+            return flags + ['--entrypoint=python3',image,'/trusted/server_qa.py','--directory','deploy/cloudflare',
+                            '--worker',str(worker),'--workers',str(workers)]
         return flags + ["--entrypoint=python3", image, "-m", "unittest", "discover", "-s", "deploy/cloudflare", "-p", "test_*.py", "-v"]
     return flags + ["--entrypoint=node", image, "--test", "--test-reporter=tap", "/source/deploy/cloudflare/test_outbound443_worker.mjs"]
 
@@ -159,6 +171,7 @@ def private_log(path, data):
 
 
 def check(config, source, commit, output):
+    started = time.monotonic()
     output = Path(output).absolute()
     require(not output.exists())
     output.mkdir(parents=True, mode=0o700)
@@ -168,20 +181,40 @@ def check(config, source, commit, output):
         hashes = snapshot(Path(source), commit, curated_source)
         fixture_hashes = copy_fixtures(config, curated_source)
         outcomes = {}
-        for language, parser in (("python", python_result), ("node", node_result)):
-            log = output / (language + ".private.log")
+        workers = config.get('python_workers',1)
+        def run(language,index=None):
+            name = language if index is None else language+'-worker-'+str(index)
+            log = output / (name + ".private.log")
+            work = output / name;work.mkdir()
             try:
                 # Share the trusted server-QA lifetime guard. Its generated
                 # name/CID file are outside the source mount, so even a test
                 # that stops itself cannot outlive this bounded operation.
-                engine.run_test_container(container(config[language + "_image"], curated_source, language),
-                                          work=output, timeout=1200, log=log)
+                engine.run_test_container(container(config[language + "_image"], curated_source, language,index,workers),
+                                          work=work, timeout=1200, log=log)
             except engine.DeploymentError:
                 if not log.exists():
                     private_log(log, b"Transport sandbox exceeded its lifetime or failed cleanup.\n")
                 raise ValueError("transport sandbox failed") from None
-            outcomes[language] = parser(log.read_bytes(), config["minimum_" + language + "_tests"])
-            outcomes[language]["log_sha256"] = engine.digest(log)
+            if index is not None:
+                reports=[json.loads(line[len(server_qa.MARKER):]) for line in log.read_text().splitlines() if line.startswith(server_qa.MARKER)]
+                require(len(reports)==1)
+                return reports[0]
+            parser = python_result if language=='python' else node_result
+            return parser(log.read_bytes(),config['minimum_'+language+'_tests'])
+        with ThreadPoolExecutor(max_workers=workers+1,thread_name_prefix='transport-qa') as pool:
+            python=[pool.submit(run,'python',index) for index in range(workers)] if workers>1 else [pool.submit(run,'python')]
+            node=pool.submit(run,'node')
+            reports=[future.result() for future in python]
+            outcomes['node']=node.result()
+        if workers>1:
+            aggregate=server_qa.aggregate(reports,workers,config['minimum_python_tests'])
+            outcomes['python']=dict(aggregate,passed=aggregate['tests'])
+            private_log(output/'python.private.log',b'\n'.join((output/('python-worker-'+str(index)+'.private.log')).read_bytes() for index in range(workers)))
+        else:outcomes['python']=reports[0]
+        for language in ('python','node'):
+            outcomes[language]['log_sha256']=engine.digest(output/(language+'.private.log'))
+        engine.build_logs.emit('Fresh transport QA complete: '+str(round(time.monotonic()-started,3))+' seconds; '+str(workers)+' Python workers.')
         require(engine.tree(curated_source) == dict(hashes, **fixture_hashes))
         receipt = {"schema": 1, "commit": commit, "passed": True, "source_files": hashes,
                    "fixture_files": fixture_hashes,

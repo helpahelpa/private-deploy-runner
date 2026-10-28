@@ -22,6 +22,8 @@ from types import SimpleNamespace
 import build_logs
 import native_apk
 import client_qa
+import component_inputs
+import git_source
 import zipfile
 
 PRIVATE = Path(__file__).resolve().parents[1]
@@ -159,6 +161,7 @@ def snapshot(source, commit, destination, lfs_object_store=None):
         raise ValueError('Commit mismatch')
     entries = execute(['git', '-C', source, 'ls-tree', '-rz', '--full-tree', commit]).split(b'\0')
     hashes = {}
+    admitted = []
     for entry in entries:
         if not entry:
             continue
@@ -166,11 +169,12 @@ def snapshot(source, commit, destination, lfs_object_store=None):
         mode, kind, oid = header.split()
         name = raw_name.decode('utf-8')
         parts = PurePosixPath(name)
-        if parts.is_absolute() or '..' in parts.parts or '\\' in name or '\x00' in name:
+        if parts.is_absolute() or '..' in parts.parts or '.git' in parts.parts or '\\' in name or '\x00' in name:
             raise ValueError('Unsafe source filename')
         if mode not in (b'100644', b'100755') or kind != b'blob':
             raise ValueError('Source must contain regular files only')
-        data = execute(['git', '-C', source, 'cat-file', 'blob', oid.decode()])
+        admitted.append((name, oid.decode()))
+    for (name, _), data in zip(admitted, git_source.read_blobs(source, [oid for _, oid in admitted])):
         lfs = re.fullmatch(rb'version https://git-lfs.github.com/spec/v1\noid sha256:([0-9a-f]{64})\nsize ([0-9]+)\n', data)
         if lfs:
             expected = lfs[1].decode()
@@ -238,7 +242,7 @@ def container_command(config, mounts, command, writable=None, *, qa=False):
         raise ValueError('Client sandbox image must be pinned by immutable local image ID')
     argv = ['docker', 'run', '--rm', '--pull=never', '--network=none', '--read-only',
             '--user=1000:1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-            '--pids-limit=256', '--memory=' + ('2560m' if qa else '4g'), '--cpus=' + ('2' if qa else '4'),
+            '--pids-limit=256', '--memory=' + ('2g' if qa else '4g'), '--cpus=' + ('2' if qa else '4'),
             '--tmpfs=/tmp:rw,nosuid,nodev,size=1g,mode=1777',
             '--tmpfs=/work:rw,nosuid,nodev,size=2g,mode=1777',
             '--tmpfs=/mnt:rw,nosuid,nodev,size=1g,mode=1777',
@@ -265,20 +269,21 @@ def verify_unchanged(pins):
 
 def qa_identity(tree, fixtures, inputs, vendor, config, compiled):
     """All admitted source and readable mount bytes, deliberately conservative."""
-    return client_qa.fingerprint({'schema': 1, 'source': tree, 'fixtures': fixtures,
+    return client_qa.fingerprint({'schema': 2, 'source': component_inputs.identity(tree, 'client'), 'fixtures': fixtures,
         'inputs': {name: digest(path) for name, path in inputs.items()},
         'trusted': client_qa.tree_identity(vendor),
         'controller': {name: {'sha256': digest(PRIVATE / 'scripts' / name),
                               'mode': (PRIVATE / 'scripts' / name).stat().st_mode & 0o777} for name in
-                       ('build_client.py', 'client_qa.py', 'build_logs.py', 'native_apk.py')},
+                       ('build_client.py', 'client_qa.py', 'client-qa-weights.json', 'component_inputs.py',
+                        'git_source.py', 'build_logs.py', 'native_apk.py')},
         'toolchains': {tool['target']: client_qa.tree_identity(tool['path'])
                        for tool in config.get('toolchains', [])},
         'config_sha256': client_qa.fingerprint(config), 'compiled': compiled})
 
 
 def qa_commands(commands, workers):
-    if type(workers) is not int or not 1 <= workers <= 3:
-        raise ValueError('Client QA workers must be between one and three')
+    if type(workers) is not int or not 1 <= workers <= 4:
+        raise ValueError('Client QA workers must be between one and four')
     if commands == [['python3', '/trusted/regression.py']]:
         return [commands[0] + ['--shard-index', str(index), '--shard-count', str(workers)]
                 for index in range(workers)]
@@ -289,6 +294,7 @@ def qa_commands(commands, workers):
 
 def build(args):
     global DIAGNOSTICS
+    build_started = time.monotonic()
     match = re.fullmatch(r'4\.2\.0\.([1-9][0-9]*)', args.version)
     if not match or not 62 <= int(match[1]) <= 2147483647:
         raise ValueError('Release version must be an allocated 4.2.0.N with N >= 62')
@@ -311,8 +317,9 @@ def build(args):
     credential = apk_download_credentials(config)
     validate_build_mounts(config, inputs, vendor, credential)
     trusted_pins = {str(path): digest(path) for path in vendor.rglob('*') if path.is_file() and '__pycache__' not in path.parts}
-    trusted_pins[str(Path(__file__).resolve())] = digest(__file__)
-    trusted_pins[str(Path(client_qa.__file__).resolve())] = digest(client_qa.__file__)
+    for path in (Path(__file__),Path(client_qa.__file__),Path(component_inputs.__file__),
+                 Path(git_source.__file__),client_qa.WEIGHTS):
+        trusted_pins[str(path.resolve())] = digest(path)
     pins = {str(path): digest(path) for path in inputs.values()}
     if credential is not None:
         pins[str(credential)] = digest(credential)
@@ -330,7 +337,12 @@ def build(args):
         stage = Path(temp)
         source = stage / 'source'
         source.mkdir()
+        snapshot_started = time.monotonic()
         tree = snapshot(Path(args.source).resolve(), args.commit, source, config.get('lfs_object_store'))
+        build_logs.emit('Client source preparation: ' + str(round(time.monotonic()-snapshot_started, 3)) + ' seconds.')
+        qa_tree = component_inputs.client_source(tree)
+        for name in tree.keys() - qa_tree.keys():
+            (source / name).unlink()
         (source / 'server/logs').mkdir(parents=True, exist_ok=True)
         prod = production_sources(tree)
         apk_key = apk_fingerprint(prod, inputs, vendor, tool_pins, config)
@@ -369,6 +381,7 @@ def build(args):
         write_json(root / 'compile.json', compile_config)
         common_mounts = [(vendor, '/trusted'),
                          (PRIVATE / 'scripts/client_qa.py', '/controller/client_qa.py'),
+                         (client_qa.WEIGHTS, '/controller/client-qa-weights.json'),
                          *[(t['path'], t['target']) for t in config.get('toolchains', [])]]
         if reusable:
             build_logs.emit('Material APK inputs are unchanged; reusing the exact signed APK and native payload.')
@@ -418,6 +431,8 @@ def build(args):
             results = client_qa.run_parallel(partitioned, workers, run_partition)
             for command, result in zip(partitioned, results):
                 summary = client_qa.parse_result(result.stdout)
+                build_logs.emit('Client QA worker '+str(summary.get('shard_index'))+': '
+                    +str(summary.get('tests'))+' tests in '+str(summary.get('elapsed_seconds'))+' seconds.')
                 tests.append({'command': command, 'result': summary, 'exit_code': result.returncode,
                               'stdout_sha256': hashlib.sha256(result.stdout).hexdigest(),
                               'stderr_sha256': hashlib.sha256(result.stderr).hexdigest()})
@@ -427,6 +442,23 @@ def build(args):
                     raise ValueError('Exact-commit client sandbox regression failed')
             tested_source_commit = args.commit
         qa_totals = client_qa.validate_results(tests, required_ids, minimum_tests)
+        # Retain expensive QA evidence even if a later packaging operation fails.
+        # Reuse is admitted only after the same frozen-input checks as a complete
+        # build; packaging, signing and live deployment still have their own gate.
+        source_before = dict(qa_tree, **fixture_pins)
+        if not cached_qa:
+            verify_unchanged(pins)
+            source_after = {name: digest(source / name) for name in source_before}
+            if source_before != source_after or qa_identity(tree, fixture_pins, inputs, vendor, config, compiled_identity) != qa_key:
+                raise ValueError('Frozen client QA dependencies changed during testing')
+        qa_evidence = {'qa':qa_totals,'commands':tests,'input_sha256':qa_key,
+                       'tested_source_commit':tested_source_commit,'reused':bool(cached_qa)}
+        evidence_path=output.parent/(output.name+'.qa.private.json')
+        with os.fdopen(os.open(evidence_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:
+            json.dump(qa_evidence,stream,sort_keys=True)
+        if not cached_qa:
+            with qa_store.locked():
+                qa_store.publish(qa_key, args.commit, tests, b'\n'.join(test_output), required_ids, minimum_tests)
         # Source tests only see read-only source, copied fixtures and toolchain mounts.
         # The signer is loaded only after every test container has exited.
         sys.path[:0] = [str(root / 'launch-build'), str(root / 'server')]
@@ -510,7 +542,7 @@ def build(args):
                 if any(secret.encode() in raw for secret in config.get('forbidden_apk_strings', []) if secret):
                     raise ValueError('Forbidden private route or credential data in APK')
         verify_unchanged(pins)
-        source_before = dict(tree, **fixture_pins)
+        source_before = dict(qa_tree, **fixture_pins)
         source_after = {name: digest(source / name) for name in source_before}
         if source_before != source_after:
             raise ValueError('Frozen sandbox source changed during testing')
@@ -527,7 +559,7 @@ def build(args):
                    'qa': dict(qa_totals, input_sha256=qa_key, tested_source_commit=tested_source_commit,
                               current_source_commit=args.commit, reused=bool(cached_qa),
                               force_full_qa=force_full_qa, workers=workers,
-                              boundary='entire admitted source, fixtures, trusted harness, configuration, mounted toolchains and compiled payload'),
+                              boundary='isolated client inputs, shared server production, fixtures, harness, configuration, tools and compiled payload'),
                    'production_sources': prod, 'fixture_sha256': fixture_pins, 'commands': tests,
                    'verified_apk': {'input_sha256': apk_key, 'source_commit': apk_source_commit,
                                     'sha256': digest(package_args.output), 'version_code': apk_version_code,
@@ -568,9 +600,7 @@ def build(args):
         manifest['asset_files']['apk-update.json'] = digest(artifacts / 'assets/apk-update.json')
         write_json(artifacts / 'manifest.json', manifest)
         artifacts.rename(output)
-        if not cached_qa:
-            with qa_store.locked():
-                qa_store.publish(qa_key, args.commit, tests, b'\n'.join(test_output), required_ids, minimum_tests)
+        build_logs.emit('Client component complete: ' + str(round(time.monotonic()-build_started, 3)) + ' seconds.')
         return manifest
 
 

@@ -21,6 +21,8 @@ import urllib.request
 import uuid
 import build_logs
 import server_qa
+import component_inputs
+import git_source
 
 BASE = 'python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72'
 PROTOCOL = 'clone-coop-handoff-v1'
@@ -205,6 +207,7 @@ def make_test_certs(destination):
 
 
 def build_server(source, commit, output, game_data=None, game_text=None, data_compatibility=COMPATIBILITY,*,component_cache=None,force_full_qa=False,qa_workers=2):
+    started = time.monotonic()
     require(compatible_schema(data_compatibility), 'Invitation-enforcing compatibility policy required')
     require(type(force_full_qa) is bool and type(qa_workers) is int and 1<=qa_workers<=4,'Invalid server QA policy')
     source, output = Path(source).resolve(), Path(output).absolute()
@@ -219,17 +222,26 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
         # NUL records preserve literal Git names. Line splitting and Git's
         # quoted output can otherwise hide controls or change filename meaning.
         names=run(['git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-C',str(source),
-                   'ls-tree','-rz','--name-only',commit,'--','server','launch-build'])
-        committed=[raw.decode('utf-8') for raw in names.split(b'\0') if raw]
+                   'ls-tree','-rz','--full-tree',commit])
+        objects={}
+        for raw in names.split(b'\0'):
+            if not raw:continue
+            header,name=raw.split(b'\t',1);mode,kind,oid=header.split()
+            objects[name.decode('utf-8')]=(mode.decode(),kind.decode(),oid.decode())
+        committed=list(objects)
         curated=[n for n in committed if (n.startswith('server/') and '/' not in n[len('server/'):] and (n.endswith('.py') or n=='server/native_contracts.json'))]
-        fixture_names=[n for n in committed if (n.startswith('launch-build/') and n.endswith('.py')) or (n.startswith('server/test_') and n.endswith('.json'))]
-        for name in set(curated+fixture_names):
+        potential_fixtures=[n for n in committed if (n.startswith('launch-build/') and n.endswith('.py')) or (n.startswith('server/test_') and n.endswith('.json'))]
+        for name in set(curated+potential_fixtures):
             source_build_path(name)
+        fixture_names=[n for n in potential_fixtures if n in component_inputs.SERVER_FIXTURES or n.startswith('server/')]
+        selected=sorted(set(curated+fixture_names))
+        require(all(objects[n][0] in ('100644','100755') and objects[n][1]=='blob' for n in selected),'Unsafe server source kind')
+        contents=dict(zip(selected,git_source.read_blobs(source,[objects[n][2] for n in selected])))
         require('server/multiplayer_server.py' in curated,'Server entry point missing')
         source_hashes={}
         for name in curated:
             path=source/name;require(path.is_file() and not path.is_symlink(),'Unsafe server source file')
-            content=run(['git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-C',str(source),'show',commit+':'+name])
+            content=contents[name]
             require(len(content)<=32*1024*1024,'Oversized source file')
             target=context/name;target.write_bytes(content);os.utime(target,(0,0))
             source_hashes[name]=hashlib.sha256(content).hexdigest()
@@ -238,7 +250,7 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
             path=source/name
             require(path.is_file() and not path.is_symlink(),'Unsafe test fixture')
             target=fixtures/name;target.parent.mkdir(parents=True,exist_ok=True)
-            target.write_bytes(run(['git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-C',str(source),'show',commit+':'+name]))
+            target.write_bytes(contents[name])
         data=None;text=None
         if game_data:
             data=Path(game_data).resolve();require(data.is_dir(),'GameData directory missing')
@@ -246,7 +258,10 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
         if game_text:
             text=Path(game_text).absolute();require(text.is_file() and not text.is_symlink(),'GameText fixture missing')
         def material():
-            return {'schema':1,'server':source_hashes,'fixtures':tree(fixtures),'game_data':tree(data) if data else None,
+            return {'schema':2,'server':source_hashes,'fixtures':tree(fixtures),
+                    'source_boundary':component_inputs.identity({n:':'.join(v) for n,v in objects.items()},'server'),
+                    'boundary_policy':digest(component_inputs.__file__),'object_reader':digest(git_source.__file__),
+                    'game_data':tree(data) if data else None,
                     'game_text':digest(text) if text else None,'base':BASE,'dockerfile':DOCKERFILE,
                     'compatibility':data_compatibility,'protocol':PROTOCOL,'workers':qa_workers,
                     'engine':digest(__file__),'qa_runner':digest(server_qa.__file__),'build_logging':digest(build_logs.__file__),
@@ -343,6 +358,7 @@ with tempfile.TemporaryDirectory() as t:
         write_json(artifact/'server.json',receipt)
         if store and not cached:store.publish(cache_key,artifact)
         os.replace(artifact,output)
+        build_logs.emit('Server component complete: '+str(round(time.monotonic()-started,3))+' seconds.')
     return {'commit':commit,'image':image,'tests_passed':True}
 
 

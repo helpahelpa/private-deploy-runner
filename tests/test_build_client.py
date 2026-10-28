@@ -24,7 +24,8 @@ class ClientBoundaryTests(unittest.TestCase):
             tools = root / 'tools';tools.mkdir();runtime = tools / 'unlisted-runtime.dll';runtime.write_bytes(b'runtime1')
             fixture = root / 'fixture';fixture.write_bytes(b'fixture1')
             config = {'image': 'sha256:' + '1' * 64, 'toolchains': [{'path': str(tools), 'target': '/toolchain/jdk'}]}
-            source = {'launch-build/test_fixture.py': 'a', 'server/shared.py': 'b', 'README.md': 'c'}
+            source = {'launch-build/test_fixture.py': 'a', 'server/shared.py': 'b', 'README.md': 'c',
+                      'server/test_feature.py': 'd', 'deploy/cloudflare/relay.py': 'e', 'future.config': 'f'}
             def identity(**overrides):
                 values = dict(tree=source, fixtures={'fixture': 'fixture1'}, inputs={'fixture': fixture}, vendor=vendor,
                               config=config, compiled={'dex': 'one'})
@@ -32,7 +33,13 @@ class ClientBoundaryTests(unittest.TestCase):
                 return build.qa_identity(**values)
             before = identity()
             for name in source:
-                changed = dict(source);changed[name] = 'changed';self.assertNotEqual(identity(tree=changed), before)
+                changed = dict(source);changed[name] = 'changed'
+                if name in ('README.md', 'server/test_feature.py', 'deploy/cloudflare/relay.py'):
+                    self.assertEqual(identity(tree=changed), before)
+                else:self.assertNotEqual(identity(tree=changed), before)
+            self.assertNotEqual(identity(tree=dict(source, **{'unknown/new.file': 'new'})), before)
+            removed = dict(source);del removed['server/test_feature.py']
+            self.assertNotEqual(identity(tree=removed), before)
             self.assertNotEqual(identity(fixtures={'fixture': 'changed'}), before)
             self.assertNotEqual(identity(compiled={'dex': 'changed'}), before)
             changed = dict(config, image='sha256:' + '2' * 64);self.assertNotEqual(identity(config=changed), before)
@@ -69,12 +76,18 @@ class ClientBoundaryTests(unittest.TestCase):
             (repo / 'prepare_multiplayer_client.py').write_text('raise SystemExit("host execution forbidden")')
             (repo / 'Build.csproj').write_text('<Project><Target Name="Malicious" /></Project>')
             (repo / 'source.java').write_text('original')
+            (repo / 'empty.bin').write_bytes(b'')
+            (repo / 'binary.bin').write_bytes(b'\x00\n\xff\n')
+            (repo / 'duplicate.bin').write_bytes(b'\x00\n\xff\n')
             commit = self.commit(repo)
             (repo / 'source.java').write_text('dirty')
             snapshot = root / 'snapshot'
             snapshot.mkdir()
             pins = build.snapshot(repo, commit, snapshot)
             self.assertEqual((snapshot / 'source.java').read_text(), 'original')
+            self.assertEqual((snapshot / 'empty.bin').read_bytes(),b'')
+            self.assertEqual((snapshot / 'binary.bin').read_bytes(),b'\x00\n\xff\n')
+            self.assertEqual((snapshot / 'duplicate.bin').read_bytes(),b'\x00\n\xff\n')
             self.assertIn('Build.csproj', pins)
             self.assertEqual(pins['source.java'], build.digest(snapshot / 'source.java'))
 

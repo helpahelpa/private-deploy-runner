@@ -24,6 +24,7 @@ import deploy_engine as engine
 import check_transport as transport
 import build_logs
 import native_apk
+import git_source
 import watch_master as watch
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -293,8 +294,8 @@ class Operations:
             shutil.rmtree(destination)
         destination.mkdir(parents=True, mode=0o700)
         entries = self.git("--git-dir=" + str(cache), "ls-tree", "-rz", "--full-tree", sha).split(b"\0")
-        total = 0
         pointers = {}
+        admitted = []
         for entry in entries:
             if not entry:
                 continue
@@ -304,12 +305,10 @@ class Operations:
             path = PurePosixPath(name)
             require(mode in (b"100644", b"100755") and kind == b"blob" and not path.is_absolute()
                     and ".." not in path.parts and ".git" not in path.parts and "\\" not in name)
-            size = int(self.git("--git-dir=" + str(cache), "cat-file", "-s", oid.decode()))
-            total += size
-            require(size <= 32 * 1024 * 1024 and total <= 512 * 1024 * 1024)
+            admitted.append((name, oid.decode()))
+        for (name, _), data in zip(admitted, git_source.read_blobs(cache, [oid for _, oid in admitted])):
             target = destination / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            data = self.git("--git-dir=" + str(cache), "cat-file", "blob", oid.decode())
             pointer = LFS_POINTER.fullmatch(data)
             if pointer:
                 object_id, object_size = pointer[1].decode(), int(pointer[2])
@@ -350,7 +349,9 @@ class Operations:
             self.replay_logs(cached)
             return cached / "release"
         build_logs.emit("Fetching exact source commit " + sha)
+        source_started = time.monotonic()
         source = self.source(sha) if request_id is None else self.source(sha, request_id=request_id)
+        build_logs.emit('Exact source fetch and preparation: ' + str(round(time.monotonic()-source_started, 3)) + ' seconds.')
         builds = self.root / "builds"
         builds.mkdir(parents=True, exist_ok=True, mode=0o700)
         scratch = builds / (key + ".incomplete")

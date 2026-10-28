@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import types
 import threading
 import time
 import unittest
@@ -46,8 +47,35 @@ class ClientQATests(unittest.TestCase):
 
 
     def test_aggregate_rejects_skips_failure_missing_duplicate_or_different_discovery(self):
+        class Case(unittest.TestCase):
+            def __init__(self, name):
+                super().__init__('runTest');self.name = name
+            def id(self):return self.name
+        inventory = ['alpha.A.test_a', 'alpha.A.test_b', 'alpha.B.test_c',
+                     'beta.C.test_a', 'gamma.D.test_a']
+        groups = []
+        for index in range(3):
+            suite, found = qa.selected_suite(unittest.TestSuite(Case(name) for name in inventory), index, 3)
+            groups.append([case.id() for case in suite])
+            self.assertEqual(found, inventory)
+        self.assertEqual(groups, [inventory[:3], inventory[3:4], inventory[4:]])
+        fixtures = []
+        cases = []
+        for name in ('fixture_alpha','fixture_beta'):
+            module=types.ModuleType(name);sys.modules[name]=module
+            self.addCleanup(sys.modules.pop,name)
+            case=type('Case',(unittest.TestCase,),{'__module__':name,'runTest':lambda self:None,
+                'setUpClass':classmethod(lambda cls:fixtures.append(('setup',cls.__module__))),
+                'tearDownClass':classmethod(lambda cls:fixtures.append(('cleanup',cls.__module__)))})
+            cases.append(case())
+        suite,_=qa.selected_suite(unittest.TestSuite(cases),0,1)
+        result=unittest.TestResult();suite.run(result)
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(fixtures,[('setup','fixture_alpha'),('cleanup','fixture_alpha'),
+                                   ('setup','fixture_beta'),('cleanup','fixture_beta')])
         good = commands()
         self.assertEqual(qa.validate_results(good, ['fixture.case8'], 9)['tests'], 9)
+        self.assertEqual(qa.validate_results(commands(4), ['fixture.case8'], 9)['tests'], 9)
         bad = []
         changed = copy.deepcopy(good);changed[0]['result']['skipped'] = 1;bad.append(changed)
         changed = copy.deepcopy(good);changed[0]['exit_code'] = 1;bad.append(changed)
@@ -117,6 +145,7 @@ class ClientQATests(unittest.TestCase):
         self.assertEqual(active, 0)
         self.assertEqual(sorted(finished), [1, 2])
         self.assertEqual(qa.run_parallel([3, 2, 1], 3, lambda value: value), [3, 2, 1])
+        self.assertEqual(qa.run_parallel([0, 1, 2, 3], 4, lambda value: value), [0, 1, 2, 3])
 
 
 if __name__ == '__main__':

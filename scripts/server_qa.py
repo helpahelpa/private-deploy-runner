@@ -46,7 +46,8 @@ def aggregate(reports,workers,minimum_tests=1):
         if (report.get('worker')!=index or report.get('workers')!=workers or report.get('inventory')!=expected
                 or report.get('selected')!=groups[index] or report.get('executed')!=groups[index]
                 or report.get('tests')!=len(groups[index]) or report.get('passed') is not True
-                or any(report.get(name)!=0 for name in ('failures','errors','skipped'))):
+                or any(report.get(name)!=0 for name in ('failures','errors','skipped'))
+                or any(report.get(name,0)!=0 for name in ('expected_failures','unexpected_successes'))):
             raise ValueError('Incomplete or failed server QA partition')
         executed.extend(report['executed'])
     if sorted(executed)!=expected or len(executed)!=len(set(executed)):
@@ -122,8 +123,9 @@ def flatten(suite):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--worker',type=int,required=True);parser.add_argument('--workers',type=int,required=True)
+    parser.add_argument('--directory',default='.')
     args=parser.parse_args()
-    tests=list(flatten(unittest.defaultTestLoader.discover('.',pattern='test_*.py')))
+    tests=list(flatten(unittest.defaultTestLoader.discover(args.directory,pattern='test_*.py')))
     inventory=sorted(test.id() for test in tests);groups=partition(inventory,args.workers)
     if not 0<=args.worker<args.workers:raise ValueError('Invalid server QA worker')
     selected=groups[args.worker];chosen=set(selected)
@@ -136,7 +138,9 @@ def main():
     result=runner.run(unittest.TestSuite(test for test in tests if test.id() in chosen))
     report={'worker':args.worker,'workers':args.workers,'inventory':inventory,'selected':selected,
             'executed':sorted(result.executed),'tests':result.testsRun,'failures':len(result.failures),
-            'errors':len(result.errors),'skipped':len(result.skipped),'passed':result.wasSuccessful() and not result.skipped}
+            'errors':len(result.errors),'skipped':len(result.skipped),
+            'expected_failures':len(result.expectedFailures),'unexpected_successes':len(result.unexpectedSuccesses),
+            'passed':result.wasSuccessful() and not result.skipped and not result.expectedFailures}
     print(MARKER+json.dumps(report,sort_keys=True),flush=True)
     return 0 if report['passed'] else 1
 

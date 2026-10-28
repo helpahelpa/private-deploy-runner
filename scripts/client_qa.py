@@ -4,15 +4,63 @@ from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import tempfile
+import time
 import unittest
 
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 COMMIT = re.compile(r'[0-9a-f]{40}\Z')
+WEIGHTS = Path(__file__).with_name('client-qa-weights.json')
+PARTITION = 'duration-weighted whole modules v1'
+
+
+def partition(inventory, count):
+    """Keep module/class fixtures together; schedule longest measured files first."""
+    if type(count) is not int or not 1 <= count <= 4 or inventory != sorted(set(inventory)):
+        raise ValueError('Invalid client QA inventory')
+    record = json.loads(WEIGHTS.read_text())
+    weights = record['seconds']
+    if (record.get('schema') != 1 or not isinstance(weights, dict)
+            or any(not isinstance(name, str) or type(value) not in (int, float)
+                   or not math.isfinite(value) or value <= 0 for name, value in weights.items())):
+        raise ValueError('Invalid client QA duration weights')
+    modules = {}
+    for name in inventory:
+        modules.setdefault(name.rsplit('.', 2)[0], []).append(name)
+    # New files receive a conservative setup allowance plus their case count.
+    default = max(weights.values(), default=30)
+    costs = {name: weights.get(name, default + len(cases)) for name, cases in modules.items()}
+    groups, loads = [[] for _ in range(count)], [0.0] * count
+    for name in sorted(modules, key=lambda name: (-costs[name], name)):
+        index = min(range(count), key=lambda index: (loads[index], index))
+        groups[index].extend(modules[name]);loads[index] += costs[name]
+    return [sorted(group) for group in groups]
+
+
+class MeasuredSuite(unittest.TestSuite):
+    """Measure complete module setup, cases and cleanup without splitting fixtures."""
+    def run(self, result, debug=False):
+        modules = {}
+        for case in self:
+            modules.setdefault(case.id().rsplit('.', 2)[0], []).append(case)
+        self.module_seconds = {}
+        started = time.monotonic()
+        for name, cases in modules.items():
+            before = time.monotonic()
+            unittest.TestSuite(cases).run(result, debug=debug)
+            # Each top-level module suite already completed class/module cleanup.
+            # Do not let the next suite clean that previous fixture up again.
+            result._previousTestClass = None
+            self.module_seconds[name] = round(time.monotonic() - before, 6)
+            if result.shouldStop:
+                break
+        self.elapsed_seconds = round(time.monotonic() - started, 6)
+        return result
 
 
 def digest(path):
@@ -45,7 +93,7 @@ def fingerprint(material):
 
 
 def run_parallel(commands, workers, run):
-    if type(workers) is not int or not 1 <= workers <= 3:
+    if type(workers) is not int or not 1 <= workers <= 4:
         raise ValueError('Invalid client QA worker limit')
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='client-qa') as pool:
         futures = [pool.submit(run, command) for command in commands]
@@ -71,7 +119,7 @@ def parse_result(stdout):
 
 
 def selected_suite(suite, index, count):
-    if type(index) is not int or type(count) is not int or not 1 <= count <= 3 or not 0 <= index < count:
+    if type(index) is not int or type(count) is not int or not 1 <= count <= 4 or not 0 <= index < count:
         raise ValueError('Invalid client QA partition')
     def flatten(item):
         if isinstance(item, unittest.TestSuite):
@@ -83,8 +131,8 @@ def selected_suite(suite, index, count):
     discovered = sorted(case.id() for case in cases)
     if len(set(discovered)) != len(discovered):
         raise ValueError('Duplicate discovered client tests')
-    admitted = set(discovered[index::count])
-    return unittest.TestSuite(case for case in cases if case.id() in admitted), discovered
+    admitted = set(partition(discovered, count)[index])
+    return MeasuredSuite(case for case in cases if case.id() in admitted), discovered
 
 
 def validate_results(commands, required=(), minimum=1):
@@ -108,9 +156,13 @@ def validate_results(commands, required=(), minimum=1):
         if 'shard_count' in result:
             count, index = result['shard_count'], result.get('shard_index')
             found = result.get('discovered_test_ids')
-            if (type(count) is not int or type(index) is not int or not 1 <= count <= 3 or not 0 <= index < count
+            policy = result.get('partition')
+            if policy is not None and (policy != PARTITION or result.get('weights_sha256') != digest(WEIGHTS)):
+                raise ValueError('Client QA scheduling policy mismatch')
+            if (type(count) is not int or type(index) is not int or not 1 <= count <= 4 or not 0 <= index < count
                     or not isinstance(found, list) or any(not isinstance(name, str) for name in found)
-                    or found != sorted(set(found)) or sorted(result['test_ids']) != found[index::count]
+                    or found != sorted(set(found))
+                    or sorted(result['test_ids']) != (partition(found, count)[index] if policy else found[index::count])
                     or (discovery is not None and discovery != found)):
                 raise ValueError('Client QA partition coverage mismatch')
             discovery = found
