@@ -804,7 +804,7 @@ class Broker:
             require(self.operations.current() == sha)
             self.stage(key, "promote")
             restarted=True
-            published='unchanged'
+            published='handoff'
             if request_id is not None:
                 # A release that changes neither the server image nor the assets is
                 # adopted in place; changed assets alone are published onto the
