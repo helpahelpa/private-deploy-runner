@@ -13,7 +13,7 @@ import deploy_engine as engine
 
 IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-PYTHON_FLOOR = 60
+PYTHON_FLOOR = 59
 NODE_FLOOR = 20
 
 

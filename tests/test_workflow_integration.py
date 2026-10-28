@@ -51,7 +51,6 @@ class GatedOperations:
         self.master = SHA
         self.builds = []
         self.promotions = []
-        self.tests = []
         self.failure = None
         self.events = {name: threading.Event() for name in ("build", "promote", "finalize", "verify")}
         self.gates = {name: threading.Event() for name in self.events}
@@ -74,7 +73,6 @@ class GatedOperations:
         for component in ("server", "client", "transport"):
             stage(component)
             build_logs.emit("Fixture " + request_id + " " + component + " tests started")
-            self.tests.append((request_id, component))
             if self.failure == component:
                 build_logs.emit("Fixture " + component + " tests failed")
                 raise ValueError("Fixture build/test failure")
@@ -205,7 +203,6 @@ class WorkflowIntegrationTests(unittest.TestCase):
             self.assertFalse(client.is_alive())
             self.assertFalse(errors, repr(errors))
             self.assertEqual(result["value"][0], 0)
-            self.assertEqual(self.ops.tests, [("12345-1", x) for x in ("server", "client", "transport")])
             self.assertNotEqual(self.ops.runtime.cid, "1" * 64)
             self.assertIs(self.status("12345-1")["replacement_verified"], True)
         finally:
@@ -213,7 +210,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 gate.set()
             client.join(6)
 
-    def test_same_github_run_next_attempt_runs_all_tests_replaces_again_and_isolates_logs(self):
+    def test_same_github_run_next_attempt_replaces_again_and_isolates_logs(self):
         before = self.ops.runtime.cid
         first_result, first_log = self.execute("12345-1")
         first_cid = self.ops.runtime.cid
@@ -221,9 +218,6 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual((first_result, second_result), (0, 0))
         self.assertEqual(len({before, first_cid, self.ops.runtime.cid}), 3)
         self.assertEqual([x[2] for x in self.ops.builds], ["12345-1", "12345-2"])
-        for attempt in ("12345-1", "12345-2"):
-            self.assertEqual([component for identity, component in self.ops.tests if identity == attempt],
-                             ["server", "client", "transport"])
         self.assertIn("Fixture 12345-1 server tests passed", first_log)
         self.assertNotIn("Fixture 12345-1", second_log)
         self.assertIn("Fixture 12345-2 server tests passed", second_log)

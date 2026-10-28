@@ -192,29 +192,34 @@ class PipelineQaPolicyTests(unittest.TestCase):
 
 
 
-    def cli(self, policy, start):
+    def cli(self, policy):
         config = self.root / "runner.json"
         config.write_text(json.dumps(self.config))
         environment = {"GITHUB_RUN_ID": "34567", "GITHUB_RUN_ATTEMPT": "1", "SOURCE_SHA": A}
         if policy is not None:
             environment["FORCE_FULL_QA"] = policy
         with patch.dict(os.environ, environment, clear=True), \
-                patch.object(sys, "argv", ["pipeline.py", "--config", str(config), "--start"]), \
-                patch.object(pipeline, "start_attempt", start), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(sys, "argv", ["pipeline.py", "--config", str(config), "--start", "--state", str(self.root / "progress.json")]), \
+                contextlib.redirect_stdout(io.StringIO()):
             return pipeline.main()
 
     def test_cli_accepts_only_exact_boolean_strings_and_defaults_to_false(self):
         for value, expected in ((None, False), ("false", False), ("true", True)):
             with self.subTest(value=value):
-                start = MagicMock(return_value=0)
-                self.assertEqual(self.cli(value, start), 0)
-                self.assertIs(start.call_args.kwargs["force_full_qa"], expected)
-                self.assertEqual(start.call_args.args[2], ATTEMPT)
+                stream = MagicMock()
+                stream.__enter__.return_value = stream
+                stream.makefile.return_value.readline.return_value = (
+                    json.dumps({"ok": True, "data": self.status(expected)}) + "\n").encode()
+                with patch.object(pipeline.socket, "socket", return_value=stream):
+                    self.assertEqual(self.cli(value), 0)
+                payload = json.loads(stream.sendall.call_args.args[0])
+                self.assertIs(payload["force_full_qa"], expected)
+                self.assertEqual(payload["request_id"], ATTEMPT)
         for value in ("", "True", "FALSE", "1", "0", " true", "false\n", "null"):
             with self.subTest(value=value):
-                start = MagicMock(return_value=0)
-                self.assertEqual(self.cli(value, start), 1)
-                start.assert_not_called()
+                with patch.object(pipeline.socket, "socket") as socket:
+                    self.assertEqual(self.cli(value), 1)
+                socket.assert_not_called()
 
 
 

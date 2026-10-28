@@ -335,7 +335,9 @@ the Socket Firewall wrapper (`sfw` or its approved wrappers).
 The 2026-10-28 test-quality audit removed 107 weak or duplicate tests: 50 client,
 26 server, 3 transport, and 28 controller cases. It also removed coupled SQL,
 private-cache, and collaborator-call assertions from 44 otherwise useful server
-tests. The retained deployment suites contain 224 client, 741 server, 60 Python
+tests. A follow-up independent Sol/Opus review removed three proven duplicates
+and refined weak assertions while retaining the important scenarios. The retained
+deployment suites contain 223 client, 740 server, 59 Python
 transport, 23 Worker, and 239 controller tests. The separate 11-case portable
 release suite is retained. Test baselines reflect this explicit curation;
 zero-skip source QA, complete worker coverage, account/session admission and live

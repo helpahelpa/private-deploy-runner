@@ -313,6 +313,12 @@ class DesktopRecoveryTests(unittest.TestCase):
                                   'NetworkMode':self.engine.network,'CapDrop':['ALL'],
                                   'SecurityOpt':['no-new-privileges:true'],'RestartPolicy':{'Name':'no'}},
                     'NetworkSettings':{'Networks':{self.engine.network:{}}}}
+        self.expected_mounts=[('volume','test-data','/data',False),
+                              ('bind',str(self.root/'control'),'/control',False),
+                              ('bind',str(self.root/'game'),'/app/work/apk/luapack_extracted/GameData',True),
+                              ('bind',str(self.release/'assets'),'/assets',True)]
+        self.expected_mounts += [('bind',str(self.root/'certs'/name),'/certs/'+name,True)
+                                 for name in ('server.crt','server.key','ca.crt')]
         self.set_mounts(translated=True)
         self.commands=[];self.running=b'';self.helper_error=None
         self.cleanup=self.enterContext(patch.object(e.subprocess,'run',return_value=subprocess.CompletedProcess([],1,b'',b'No such container: fixture')))
@@ -327,7 +333,7 @@ class DesktopRecoveryTests(unittest.TestCase):
 
     def set_mounts(self,*,translated):
         self.state['Mounts']=[]
-        for kind,source,target,ro in self.engine.mounts(self.release):
+        for kind,source,target,ro in self.expected_mounts:
             value={'Type':kind,'Destination':target,'RW':not ro}
             if kind=='volume':value['Name']=source
             else:
@@ -355,7 +361,7 @@ class DesktopRecoveryTests(unittest.TestCase):
         for flag in ('--network=none','--read-only','--user=1000:1000','--cap-drop=ALL','--security-opt=no-new-privileges:true'):
             self.assertIn(flag,helper)
         mounts=[helper[n+1] for n,value in enumerate(helper) if value=='--mount']
-        expected=['type=bind,src='+source+',dst='+target+',readonly' for kind,source,target,ro in self.engine.mounts(self.release) if kind=='bind']
+        expected=['type=bind,src='+source+',dst='+target+',readonly' for kind,source,target,ro in self.expected_mounts if kind=='bind']
         self.assertCountEqual(expected,mounts)
         self.assertTrue(all('type=volume' not in value for value in mounts))
         for flag in ('--env','--publish','--privileged'):self.assertNotIn(flag,helper)

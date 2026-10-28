@@ -23,7 +23,7 @@ class TransportTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.config = {"python_image": IMAGE, "node_image": IMAGE,
-                       "minimum_python_tests": 60, "minimum_node_tests": 20}
+                       "minimum_python_tests": 59, "minimum_node_tests": 20}
 
     def repository(self):
         source = self.root / "source"
@@ -105,7 +105,7 @@ class TransportTests(unittest.TestCase):
     def test_config_rejects_commands_mutable_images_and_lowered_baselines(self):
         path = self.root / "config.json"
         for changes in ({"command": ["id"]}, {"source": "/private"}, {"node_image": "node:24"},
-                        {"minimum_python_tests": 59}, {"minimum_node_tests": 19}):
+                        {"minimum_python_tests": 58}, {"minimum_node_tests": 19}):
             path.write_text(json.dumps(dict(self.config, **changes)))
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 gate.config_read(path)
