@@ -325,6 +325,10 @@ def build_server(source, commit, output, game_data=None, game_text=None, data_co
             for module in module_ids:
                 readable=qa_tasks.server_inputs(context,source_hashes,module)
                 views[module]=qa_tasks.materialize(context,work/('source-'+module),readable)
+                for name in fixture_names:
+                    if name.startswith('server/'):
+                        target=views[module]/name;target.parent.mkdir(parents=True,exist_ok=True)
+                        os.link(fixtures/name,target)
                 identity=dict(material_inputs,server=readable,module=module,test_ids=module_ids[module],
                     source_boundary={'fallback':component_inputs.fallback_source({n:':'.join(v) for n,v in objects.items()})})
                 identity.pop('workers')

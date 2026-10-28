@@ -128,6 +128,8 @@ def main():
     parser.add_argument('--discover-only',action='store_true');parser.add_argument('--module')
     args=parser.parse_args()
     started=time.monotonic()
+    if args.module:
+        sys.path.insert(0,str(Path(args.directory).resolve()))
     suite=(unittest.defaultTestLoader.loadTestsFromName(args.module) if args.module else
            unittest.defaultTestLoader.discover(args.directory,pattern='test_*.py'))
     tests=list(flatten(suite))
