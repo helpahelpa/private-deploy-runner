@@ -97,9 +97,25 @@ def materialize(source, destination, names):
 
 
 def run(inventory, keys, store, commit, execute, *, workers, force=False, weights=None,
-        required=(), minimum=1, batches=None):
+        required=(), minimum=1, batches=None, suite_key=None):
     expected = modules(inventory)
-    if set(keys) != set(expected) or type(workers) is not int or not 1 <= workers <= 4:
+    if type(workers) is not int or not 1 <= workers <= 4:
+        raise ValueError('Invalid QA worker limit')
+    if suite_key:
+        cached = client_qa.load_cached(store, suite_key, force)
+        if cached:
+            totals = client_qa.validate_results(cached['commands'], required, minimum)
+            provenance = [dict(command['qa_module'], reused=True,
+                               reason='verified complete suite inputs unchanged') for command in cached['commands']]
+            if (totals['test_ids'] != inventory or [item['module'] for item in provenance] != list(expected)
+                    or any(item['test_ids'] != expected[item['module']] for item in provenance)):
+                raise ValueError('Cached complete suite inventory mismatch')
+            origins = {item['tested_source_commit'] for item in provenance}
+            return {'qa': totals, 'commands': cached['commands'], 'logs': [cached['log']], 'modules': provenance,
+                    'reused': True, 'fresh_tests': 0, 'suite_key': suite_key, 'suite_reused': True,
+                    'tested_source_commit': next(iter(origins)) if len(origins) == 1 else None}
+    keys = keys() if callable(keys) else keys
+    if set(keys) != set(expected):
         raise ValueError('Incomplete QA module plan')
     records, pending = {}, []
     for module in expected:
@@ -147,17 +163,19 @@ def run(inventory, keys, store, commit, execute, *, workers, force=False, weight
     commands, logs, provenance = [], [], []
     for module in expected:
         values, log, tested, reused = records[module]
-        commands.extend(values);logs.append(log)
-        provenance.append({'module': module, 'input_sha256': keys[module],
+        item = {'module': module, 'input_sha256': keys[module],
             'test_ids': expected[module], 'tests': len(expected[module]),
             'tested_source_commit': tested, 'reused': reused,
-            'reason': 'verified inputs unchanged' if reused else 'force full QA' if force else 'inputs not verified'})
+            'reason': 'verified inputs unchanged' if reused else 'force full QA' if force else 'inputs not verified'}
+        commands.extend(dict(command, qa_module=dict(item)) for command in values);logs.append(log)
+        provenance.append(item)
     totals = client_qa.validate_results(commands, required, minimum)
     if totals['test_ids'] != inventory:
         raise ValueError('Incomplete aggregate QA module coverage')
     origins = {item['tested_source_commit'] for item in provenance}
     return {'qa': totals, 'commands': commands, 'logs': logs, 'modules': provenance,
             'reused': all(item['reused'] for item in provenance),
+            'suite_key': suite_key, 'suite_reused': False,
             'tested_source_commit': next(iter(origins)) if len(origins) == 1 else None,
             'fresh_tests': sum(item['tests'] for item in provenance if not item['reused'])}
 
@@ -171,3 +189,6 @@ def publish(store, result, commit):
                 store.publish(item['input_sha256'], commit, [result['commands'][offset]],
                     result['logs'][index], item['test_ids'], item['tests'])
             offset += 1
+        if result.get('suite_key') and not result.get('suite_reused'):
+            store.publish(result['suite_key'], commit, result['commands'], b'\n'.join(result['logs']),
+                          result['qa']['test_ids'], result['qa']['tests'])

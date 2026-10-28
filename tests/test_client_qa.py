@@ -55,6 +55,15 @@ class ClientQATests(unittest.TestCase):
                 minimum=2,batches=[['alpha','beta']])
             self.assertEqual([['alpha','beta']],grouped_calls)
             self.assertEqual(inventory,grouped_result['qa']['test_ids'])
+            suite=qa_tasks.run(inventory,lambda:keys,store,COMMIT,execute,workers=2,suite_key='f'*64,minimum=2)
+            qa_tasks.publish(store,suite,COMMIT)
+            def unnecessary_plan():raise AssertionError('Unchanged suite should bypass module input planning')
+            fast=qa_tasks.run(inventory,unnecessary_plan,store,COMMIT,execute,workers=2,suite_key='f'*64,minimum=2)
+            self.assertTrue(fast['suite_reused']);self.assertEqual(inventory,fast['qa']['test_ids'])
+            calls.clear()
+            forced_suite=qa_tasks.run(inventory,lambda:keys,store,COMMIT,execute,workers=2,
+                force=True,suite_key='f'*64,minimum=2)
+            self.assertEqual(['alpha','beta'],sorted(calls));self.assertFalse(forced_suite['suite_reused'])
             with self.assertRaises(ValueError):
                 run(inventory=['alpha.C.test_added','beta.C.test_b'])
 

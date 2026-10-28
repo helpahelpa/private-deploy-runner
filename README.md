@@ -36,7 +36,8 @@ its own numeric `run-id`/`run-attempt` identity, immutable logs, tested artifact
 and deployment receipt. Each attempt assembles a new release and replaces the
 server even if that commit is already active. By default, it can reuse verified
 client/server test modules when their isolated input fingerprints match.
-An unchanged complete server also reuses its verified image and suite evidence.
+An unchanged complete client bypasses module planning after fresh discovery;
+an unchanged server reuses its verified image and suite evidence.
 Materially unchanged signed APKs
 remain byte-identical through the separate native APK cache.
 

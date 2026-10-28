@@ -153,7 +153,7 @@ def verify_download_credential_payload(apk, credential, serializer):
         raise ValueError('Signed APK download authorization payload mismatch')
 
 
-def snapshot(source, commit, destination, lfs_object_store=None):
+def snapshot(source, commit, destination, lfs_object_store=None, *, qa=False):
     """Read Git blobs directly; no archive symlinks, hooks, filters or submodules."""
     if not COMMIT.fullmatch(commit):
         raise ValueError('An exact lowercase 40-character commit is required')
@@ -190,6 +190,14 @@ def snapshot(source, commit, destination, lfs_object_store=None):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         hashes[name] = hashlib.sha256(data).hexdigest()
+    if qa:
+        for name in hashes.keys() - component_inputs.client_source(hashes).keys():
+            (destination / name).unlink()
+        # Excluded file names must not leave observable empty directories whose
+        # presence could affect a task without appearing in its readable inputs.
+        for path in sorted(destination.rglob('*'), key=lambda item: len(item.parts), reverse=True):
+            if path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
     return hashes
 
 
@@ -344,11 +352,9 @@ def build(args):
         source = stage / 'source'
         source.mkdir()
         snapshot_started = time.monotonic()
-        tree = snapshot(Path(args.source).resolve(), args.commit, source, config.get('lfs_object_store'))
+        tree = snapshot(Path(args.source).resolve(), args.commit, source, config.get('lfs_object_store'), qa=True)
         build_logs.emit('Client source preparation: ' + str(round(time.monotonic()-snapshot_started, 3)) + ' seconds.')
         qa_tree = component_inputs.client_source(tree)
-        for name in tree.keys() - qa_tree.keys():
-            (source / name).unlink()
         (source / 'server/logs').mkdir(parents=True, exist_ok=True)
         prod = production_sources(tree)
         apk_key = apk_fingerprint(prod, inputs, vendor, tool_pins, config)
@@ -441,25 +447,28 @@ def build(args):
             module_ids = qa_tasks.modules(inventory)
             if len(inventory) < minimum_tests or not set(required_ids) <= set(inventory):
                 raise ValueError('Client module inventory is incomplete')
-            views, keys = {}, {}
-            common = {name: value for name, value in qa_inputs.items() if name not in ('source', 'compiled')}
-            common_sha256 = client_qa.fingerprint(common)
-            for module in module_ids:
-                readable = qa_tasks.client_inputs(source, qa_tree, module)
-                material = {'common_sha256': common_sha256, 'module': module, 'test_ids': module_ids[module],
-                            'source': {'source': readable, 'boundary': 'isolated client module'},
-                            'compiled': compiled_identity}
-                if module in qa_tasks.BINARY_MODULES:
-                    material['source'] = {'boundary': 'isolated binary transform', 'source': readable}
-                    # These compiled outputs are never mounted into source QA.
-                    material['compiled'] = {}
-                    views[module] = (qa_tasks.materialize(source, stage / ('source-' + module),
-                                                         dict(readable, **fixture_pins)), [])
-                else:
-                    view = qa_tasks.materialize(source, stage / ('source-' + module),
-                        [name for name in readable if name.startswith('launch-build/')])
-                    views[module] = (source, [(view / 'launch-build', '/source/launch-build')])
-                keys[module] = client_qa.fingerprint(material)
+            views = {}
+            def plan_modules():
+                keys = {}
+                common = {name: value for name, value in qa_inputs.items() if name not in ('source', 'compiled')}
+                common_sha256 = client_qa.fingerprint(common)
+                for module in module_ids:
+                    readable = qa_tasks.client_inputs(source, qa_tree, module)
+                    material = {'common_sha256': common_sha256, 'module': module, 'test_ids': module_ids[module],
+                                'source': {'source': readable, 'boundary': 'isolated client module'},
+                                'compiled': compiled_identity}
+                    if module in qa_tasks.BINARY_MODULES:
+                        material['source'] = {'boundary': 'isolated binary transform', 'source': readable}
+                        # These compiled outputs are never mounted into source QA.
+                        material['compiled'] = {}
+                        views[module] = (qa_tasks.materialize(source, stage / ('source-' + module),
+                                                             dict(readable, **fixture_pins)), [])
+                    else:
+                        view = qa_tasks.materialize(source, stage / ('source-' + module),
+                            [name for name in readable if name.startswith('launch-build/')])
+                        views[module] = (source, [(view / 'launch-build', '/source/launch-build')])
+                    keys[module] = client_qa.fingerprint(material)
+                return keys
             def execute_module(module, expected):
                 command = commands[0] + ['--module', module]
                 result, summary = invoke(command, *views[module])
@@ -469,9 +478,9 @@ def build(args):
                     'stdout_sha256': hashlib.sha256(result.stdout).hexdigest(),
                     'stderr_sha256': hashlib.sha256(result.stderr).hexdigest()},
                     result.stdout + b'\nSTDERR\n' + result.stderr)
-            granular = qa_tasks.run(inventory, keys, qa_store, args.commit, execute_module,
+            granular = qa_tasks.run(inventory, plan_modules, qa_store, args.commit, execute_module,
                 workers=workers, force=force_full_qa,
-                weights=json.loads(client_qa.WEIGHTS.read_text())['seconds'], required=required_ids, minimum=minimum_tests)
+                weights=json.loads(client_qa.WEIGHTS.read_text())['seconds'], required=required_ids, minimum=minimum_tests, suite_key=qa_key)
             tests, test_output = granular['commands'], granular['logs']
             tested_source_commit = granular['tested_source_commit']
             cached_qa = granular if granular['reused'] else None

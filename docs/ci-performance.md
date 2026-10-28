@@ -11,6 +11,9 @@ QA evidence is cached by complete test module, with a separate whole-server imag
 and suite cache and an independent material-input signed APK cache. No individual
 test method is cached or separated from its class/module fixtures. Every attempt
 rediscovers the complete client and server inventories inside restricted containers.
+An unchanged complete client suite also has a sealed shortcut: after fresh
+discovery matches, it bypasses module planning and restores the same original
+module provenance. Any complete-input change falls back to finer module reuse.
 The controller requires an exact, duplicate-free union of fresh and reused IDs,
 all required cases, and zero errors, failures, skips or expected failures.
 
@@ -21,7 +24,9 @@ a read-only directory overlay. Eight reviewed expensive binary-transform modules
 retained work/output fixtures and conservative unknown configuration inputs.
 Their server and Java/C# sources are physically absent. An undeclared dynamic
 dependency therefore fails execution rather than silently escaping the key.
-New modules default to the broader client boundary. Imported helper-test changes
+New modules default to the broader client boundary. Excluded files and their
+empty parent directories are removed, so excluded path additions cannot leave
+observable inputs outside the key. Imported helper-test changes
 invalidate their consumers. Fixture, harness, toolchain and immutable image inputs
 remain conservatively shared. Worker count is scheduling-only; mounted weights
 and executable scheduling/harness policy remain hashed.

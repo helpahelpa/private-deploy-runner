@@ -79,6 +79,9 @@ class ClientBoundaryTests(unittest.TestCase):
             (repo / 'empty.bin').write_bytes(b'')
             (repo / 'binary.bin').write_bytes(b'\x00\n\xff\n')
             (repo / 'duplicate.bin').write_bytes(b'\x00\n\xff\n')
+            (repo / 'docs').mkdir();(repo / 'docs/only.md').write_text('excluded documentation')
+            (repo / 'deploy/cloudflare').mkdir(parents=True)
+            (repo / 'deploy/cloudflare/only.py').write_text('raise RuntimeError("must stay hidden")')
             commit = self.commit(repo)
             (repo / 'source.java').write_text('dirty')
             snapshot = root / 'snapshot'
@@ -90,6 +93,11 @@ class ClientBoundaryTests(unittest.TestCase):
             self.assertEqual((snapshot / 'duplicate.bin').read_bytes(),b'\x00\n\xff\n')
             self.assertIn('Build.csproj', pins)
             self.assertEqual(pins['source.java'], build.digest(snapshot / 'source.java'))
+            qa_snapshot=root/'qa-snapshot'
+            build.snapshot(repo,commit,qa_snapshot,qa=True)
+            self.assertEqual(b'\x00\n\xff\n',(qa_snapshot/'binary.bin').read_bytes())
+            self.assertFalse((qa_snapshot/'docs').exists())
+            self.assertFalse((qa_snapshot/'deploy').exists())
 
     def test_lfs_data_is_materialized_only_when_commit_pointer_hash_matches(self):
         with tempfile.TemporaryDirectory() as directory:
