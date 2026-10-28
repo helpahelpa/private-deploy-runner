@@ -422,7 +422,11 @@ class Operations:
         assets = scratch / "assets"
         active_assets = None
         try:
-            active_assets = Path(engine.Engine(self.c['engine_config']).active()['release_path']) / 'assets'
+            # Compare against the release whose assets are published: an in-place
+            # publication moves that forward while the running image stays older.
+            state = engine.Engine(self.c['engine_config']).active()
+            published = Path(state.get('assets_release_path') or state['release_path']) / 'assets'
+            active_assets = published if published.is_dir() else Path(state['release_path']) / 'assets'
         except Exception:
             active_assets = None
         if active_assets is not None and self.client_material_unchanged(active_assets, client, manifest):

@@ -194,7 +194,7 @@ class AssetsPublicationTests(unittest.TestCase):
         self.old = self.release('old', '4.2.0.76', b'old-pack')
         self.new = self.release('new', '4.2.0.99', b'new-pack')
         self.manifest = {'commit': B, 'image': IMAGE}
-        self.active = {'release': A, 'tracked': A, 'assets_release': A, 'image': IMAGE,
+        self.active = {'release': A, 'tracked': A, 'assets_release': A, 'assets_release_path': str(self.old), 'image': IMAGE,
                        'container': 'c' * 64, 'release_path': str(self.old),
                        'assets_sha256': e.assets_digest(self.old)}
 
@@ -238,6 +238,7 @@ class AssetsPublicationTests(unittest.TestCase):
         active = json.loads((self.root / 'active.json').read_text())
         self.assertEqual((B, B, A), (active['tracked'], active['assets_release'], active['release']))
         self.assertEqual(event, json.loads((self.root / 'deployments' / (event['id'] + '.json')).read_text()))
+        self.assertEqual(str(self.new), active['assets_release_path'])
 
     def test_previous_release_files_are_retained_and_older_ones_pruned(self):
         served = self.runtime.served_assets

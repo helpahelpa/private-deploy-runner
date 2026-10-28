@@ -841,6 +841,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
 
     def record_active(self,cid,release,manifest):
         value={'release':manifest['commit'],'tracked':manifest['commit'],'assets_release':manifest['commit'],
+               'assets_release_path':str(release),
                'image':manifest['image'],'container':cid,'release_path':str(release),
                'ingress':self.ingress_id(),'assets_sha256':hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()}
         value.update(self.admin.record(cid))
@@ -869,7 +870,8 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                      'image': active['image'], 'assets_sha256': assets,
                      'previous_release_path': str(old_path), 'release_path': str(path)}
             write_json(self.root/'deployments'/(deployment+'.json'), event)
-            updated = dict(active, tracked=new['commit'])
+            updated = dict(active, tracked=new['commit'], assets_release=new['commit'],
+                           assets_release_path=str(path))
             write_json(self.root/'active.json', updated)
             if self.c.get('runtime_registry'):
                 write_json(self.c['runtime_registry'], updated)
@@ -900,7 +902,8 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                    'assets_sha256':assets,'assets_release':new['commit'],
                    'previous_release_path':str(old_path),'release_path':str(path)}
             write_json(self.root/'deployments'/(deployment+'.json'),event)
-            updated=dict(active,tracked=new['commit'],assets_release=new['commit'],assets_sha256=assets)
+            updated=dict(active,tracked=new['commit'],assets_release=new['commit'],
+                         assets_release_path=str(path),assets_sha256=assets)
             write_json(self.root/'active.json',updated)
             if self.c.get('runtime_registry'):write_json(self.c['runtime_registry'],updated)
             build_logs.emit('Deployment: assets published; the running world was not restarted.')
