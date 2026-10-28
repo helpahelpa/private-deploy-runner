@@ -18,7 +18,7 @@ spec.loader.exec_module(e)
 
 A, B = 'a' * 40, 'b' * 40
 TOKEN = 'fixture-private-token-' + 'x' * 40
-IMAGE = '1' * 64
+IMAGE = 'sha256:' + '1' * 64
 
 
 class FakeOperations:

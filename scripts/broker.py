@@ -552,7 +552,7 @@ class Operations:
                 and proof.get('release_path') == str(Path(release).resolve())
                 and proof.get('previous_release_path') != proof.get('release_path')
                 and re.fullmatch(r'[0-9a-f]{64}', proof.get('container', ''))
-                and re.fullmatch(r'[0-9a-f]{64}', proof.get('image', '')))
+                and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', proof.get('image', '')))
         runtime = engine.Engine(self.c['engine_config'])
         require(json.loads((runtime.root / 'deployments' / (proof['id'] + '.json')).read_text()) == proof)
         require(runtime.status()['managed_release'] == sha)
