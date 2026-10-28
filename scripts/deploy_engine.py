@@ -110,6 +110,11 @@ def tree(path):
     return result
 
 
+def assets_digest(release):
+    """Digest of the assets a release would serve."""
+    return hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()
+
+
 def relative(value):
     require(isinstance(value, str), 'Invalid relative path')
     path = PurePosixPath(value)
@@ -535,6 +540,11 @@ class Engine:
     def active(self):
         p=self.root/'active.json';require(p.is_file() and not p.is_symlink(),'No adopted world');return json.loads(p.read_text())
 
+    def tracked(self, active=None):
+        """Latest adopted commit; the running server image may be older."""
+        active=self.active() if active is None else active
+        return active.get('tracked') or active['release']
+
     def control(self,request,timeout=3):
         secret=self.c['control']/'secret'
         require(secret.is_file() and not secret.is_symlink() and not secret.stat().st_mode & 0o077,'Private control secret required')
@@ -768,12 +778,40 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
                     timeout=max(.1,deadline-time.monotonic()))
 
     def record_active(self,cid,release,manifest):
-        value={'release':manifest['commit'],'image':manifest['image'],'container':cid,'release_path':str(release),
+        value={'release':manifest['commit'],'tracked':manifest['commit'],'image':manifest['image'],'container':cid,'release_path':str(release),
                'ingress':self.ingress_id(),'assets_sha256':hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()}
         value.update(self.admin.record(cid))
         write_json(self.root/'active.json',value)
         if self.c.get('runtime_registry'):write_json(self.c['runtime_registry'],value)
         return value
+
+    def publish_unchanged(self, release, expected_tracked):
+        """Adopt a release whose server image and assets are already active."""
+        with self.lock(wait_seconds=20):
+            path, new = self.verify(release)
+            active = self.active()
+            require(SHA.fullmatch(expected_tracked or '') and self.tracked(active) == expected_tracked,
+                    'Stale unchanged publication')
+            assets = assets_digest(path)
+            require(new['image'] == active['image'] and assets == active['assets_sha256'],
+                    'Release changes the server image or assets; a handoff is required')
+            old_path, old = self.verify(active['release_path'])
+            self.healthy(active['container'], old_path, old, time.monotonic() + self.c.get('health_timeout_seconds', 15))
+            current = self.inspect(active['container'])
+            require(current['State']['Running'] and current['Image'] == active['image'],
+                    'Active world is not the expected image')
+            deployment = uuid.uuid4().hex
+            event = {'id': deployment, 'from': old['commit'], 'to': new['commit'], 'phase': 'unchanged',
+                     'restarted': False, 'rollback': False, 'container': active['container'],
+                     'image': active['image'], 'assets_sha256': assets,
+                     'previous_release_path': str(old_path), 'release_path': str(path)}
+            write_json(self.root/'deployments'/(deployment+'.json'), event)
+            updated = dict(active, tracked=new['commit'])
+            write_json(self.root/'active.json', updated)
+            if self.c.get('runtime_registry'):
+                write_json(self.c['runtime_registry'], updated)
+            build_logs.emit('Deployment: server image and assets unchanged; the active world was left running.')
+            return event
 
     def check_desired(self,commit):
         require(self.c.get('desired_commit_file') or self.c.get('repository'),'Latest-commit authority required')
@@ -818,8 +856,8 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
     def promote(self,release,expected_current,rollback=False,*,replace_same_commit=False):
         with self.lock(wait_seconds=20):
             path,new=self.verify(release);active=self.active();old_path,old=self.verify(active['release_path'])
-            require(type(replace_same_commit) is bool and SHA.fullmatch(expected_current or '') and active['release']==expected_current,
-                    'Stale promotion')
+            require(type(replace_same_commit) is bool and SHA.fullmatch(expected_current or '')
+                    and self.tracked(active)==expected_current,'Stale promotion')
             require(new['commit']!=expected_current or (replace_same_commit and not rollback and path!=old_path),
                     'Redundant promotion requires an explicit distinct release')
             if not rollback:
@@ -946,7 +984,8 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
         with self.lock(wait_seconds=5):
             active=self.active();path,manifest=self.verify(active['release_path'])
             state=self.healthy(active['container'],path,manifest,time.monotonic()+self.c.get('health_timeout_seconds',15))
-            return {'managed_release':active['release'],'image':active['image'],'container':active['container'],'server':state}
+            return {'managed_release':active.get('tracked') or active['release'],'server_release':active['release'],
+                    'image':active['image'],'container':active['container'],'server':state}
 
 
 def main():

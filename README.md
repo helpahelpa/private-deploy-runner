@@ -88,6 +88,16 @@ replacement, registry errors, code rollback, and interrupted attempts fail the
 run. A healthy old server restored by rollback never makes the failed run green.
 Same-commit redeployment uses the normal fenced handoff and data-preserving
 snapshot checks, creates a new container, and verifies that its predecessor stopped.
+
+A commit that changes neither the server image nor the release assets - a
+documentation-only change, or anything that leaves both artifacts byte-identical -
+is adopted without touching the running world. The engine records the release
+receipt with `restarted: false`, moves the tracked commit forward while the
+server release stays the commit whose image is running, verifies the active
+container is still healthy and still the expected image, and the job reports
+`server_restarted: false`. `status` therefore separates `managed_release` (the
+latest adopted commit) from `server_release` (the running image), and a later
+image-changing commit still performs the fenced handoff from that server release.
 Set `require_request_id_for_submit: true` in production broker configuration.
 Historical pre-upgrade workflows then fail closed instead of replaying a cached
 success; create a new run using the current workflow to get the new behavior.

@@ -68,6 +68,9 @@ class AttemptOperations(FakeOperations):
         release=super().build(sha,version,stage)
         return release/str(request_id)
 
+    def release_is_active(self, release):
+        return False
+
     def promote(self,sha,release,*,replace_same_commit=False):
         if not replace_same_commit:raise AssertionError('Attempt must replace the container')
         super().promote(sha,release)

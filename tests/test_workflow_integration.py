@@ -83,6 +83,9 @@ class GatedOperations:
             self.master = OTHER
         return self.config["local_root"] / "releases" / request_id
 
+    def release_is_active(self, release):
+        return False
+
     def promote(self, sha, release, *, replace_same_commit=False):
         if replace_same_commit is not True:
             raise AssertionError("Fresh attempts must replace even the same commit")
