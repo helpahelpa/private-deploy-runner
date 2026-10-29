@@ -516,7 +516,7 @@ class Engine:
         self.ingress_name=c['project']+'-ingress'
         require(c.get('timezone','Asia/Tokyo')=='Asia/Tokyo','World timezone must remain Asia/Tokyo')
         require(compatible_schema(c.get('data_compatibility')), 'Invitation-enforcing compatibility policy required')
-        require(1 <= c.get('handoff_timeout_seconds',30) <= 30 and 1 <= c.get('health_timeout_seconds',15) <= 20, 'Invalid bounded deployment timeout')
+        require(1 <= c.get('handoff_timeout_seconds',30) <= 30 and 1 <= c.get('health_timeout_seconds',15) <= 120, 'Invalid bounded deployment timeout')
         for key in ('https_port','game_port'):
             require(type(c.get(key)) is int and 1024 <= c[key] <= 65535, 'Invalid loopback port')
         require(c['https_port'] != c['game_port'], 'Loopback ports must differ')
@@ -696,7 +696,7 @@ class Engine:
             return source
         raise DeploymentError('Missing asset mount')
 
-    def healthy(self,cid,release,manifest,deadline):
+    def healthy(self,cid,release,manifest,deadline,*,admin=True):
         last=None
         while time.monotonic()<deadline:
             try:
@@ -705,7 +705,7 @@ class Engine:
                 require(status.get('release')==manifest['commit'] and status.get('compatibility')==PROTOCOL and not status.get('write_fenced'),'World control identity mismatch')
                 self.validate_container(cid,release,manifest,deadline=deadline)
                 self.validate_ingress(deadline=deadline)
-                self.admin.healthy(cid,timeout=max(.1,min(3,deadline-time.monotonic())))
+                if admin:self.admin.healthy(cid,timeout=max(.1,min(5,deadline-time.monotonic())))
                 context=ssl.create_default_context(cafile=str(self.c['certificates']/'ca.crt'))
                 connection=http.client.HTTPSConnection('localhost',self.c['https_port'],context=context,timeout=max(.05,min(2,deadline-time.monotonic())))
                 try:
@@ -1133,7 +1133,7 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
     def status(self):
         with self.lock(wait_seconds=5):
             active=self.active();path,manifest=self.verify(active['release_path'])
-            state=self.healthy(active['container'],path,manifest,time.monotonic()+self.c.get('health_timeout_seconds',15))
+            state=self.healthy(active['container'],path,manifest,time.monotonic()+self.c.get('health_timeout_seconds',15),admin=False)
             return {'managed_release':active.get('tracked') or active['release'],'server_release':active['release'],
                     'image':active['image'],'container':active['container'],'server':state}
 

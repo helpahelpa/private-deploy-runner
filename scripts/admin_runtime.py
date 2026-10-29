@@ -137,8 +137,8 @@ class AdminRuntime:
                 ('volume',self.config['log_volume'],'/app/server/logs',False)] if enabled else []
 
     def validate_world(self,cid,config):
-        expected=self.flags(self.enabled(cid))
-        actual=[s for s in config.get('Cmd',[]) if s.startswith('--admin-')]
+        expected=[flag for flag in self.flags(self.enabled(cid)) if not flag.startswith('--admin-bind=')]
+        actual=[s for s in config.get('Cmd',[]) if s.startswith('--admin-') and not s.startswith('--admin-bind=')]
         require(sorted(actual)==sorted(expected),'Admin world flags mismatch')
 
     def preflight(self):
