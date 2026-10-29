@@ -129,7 +129,8 @@ class AdminRuntime:
 
     def flags(self,enabled):
         return ['--admin-db=/admin/admin.sqlite3','--admin-environment='+self.config['environment'],
-                '--admin-logs=/app/server/logs','--admin-port=9445'] if enabled else []
+                '--admin-logs=/app/server/logs','--admin-port=9445',
+                *(['--admin-bind=0.0.0.0'] if self.engine.c.get('admin_public_port') else [])] if enabled else []
 
     def mounts(self,enabled):
         return [('volume',self.config['state_volume'],'/admin',False),

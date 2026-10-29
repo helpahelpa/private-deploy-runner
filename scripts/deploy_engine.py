@@ -56,7 +56,7 @@ class Handler(socketserver.BaseRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
  allow_reuse_address=True
  daemon_threads=True
-for port in (9443,9444):
+for port in (9443,9444,9445):
  server=Server(('0.0.0.0',port),Handler)
  threading.Thread(target=server.serve_forever,daemon=True).start()
 threading.Event().wait()
@@ -122,15 +122,21 @@ def server_identity(release):
     return hashlib.sha256(json.dumps({'base':info['base'],'source':source},sort_keys=True).encode()).hexdigest()
 
 
-def admin_port_bindings(config, enabled):
+def admin_port_bindings(config):
     """Docker port bindings for the admin API: nothing unless explicitly published."""
-    require(type(enabled) is bool, 'Invalid admin runtime selection')
-    if not enabled or not config.get('admin_publish_address'):
-        return {}
-    address, port = config.get('admin_publish_address'), config.get('admin_public_port')
+    published = admin_publish(config)
+    return {} if published is None else {'9445/tcp': [{'HostIp': published[0], 'HostPort': str(published[1])}]}
+
+
+def admin_publish(config):
+    """The reviewed admin publication as (address, port), or None when unpublished."""
+    address = config.get('admin_publish_address')
+    if not address:
+        return None
+    port = config.get('admin_public_port')
     require(type(port) is int and 1 <= port <= 65535 and isinstance(address, str) and 0 < len(address) <= 64,
             'Invalid admin publication')
-    return {'9445/tcp': [{'HostIp': address, 'HostPort': str(port)}]}
+    return address, port
 
 
 def assets_digest(release):
@@ -630,7 +636,7 @@ class Engine:
         return mounts+self.admin.mounts(self.admin.enabled() if admin_enabled is None else admin_enabled)
 
     def validate_container(self,cid,release,manifest,*,running=True,deadline=None):
-        def budget():return max(.05,min(3,deadline-time.monotonic())) if deadline else 30
+        def budget():return max(.05,min(8,deadline-time.monotonic())) if deadline else 30
         data=self.inspect(cid,timeout=budget());host=data['HostConfig'];cfg=data['Config']
         require(data['Image']==manifest['image'] and (not running or data['State']['Running']),'World image/state mismatch')
         enabled=self.admin.enabled(cid)
@@ -663,9 +669,7 @@ class Engine:
         actual=frozenset((m['Type'],m.get('Name') if m['Type']=='volume' else m['Source'],m['Destination'],not m['RW']) for m in data['Mounts'] if m['Type']!='tmpfs')
         require(actual in expected,'Unexpected runtime mount binding')
         ports=host.get('PortBindings') or {}
-        expected_ports=admin_port_bindings(self.c,enabled)
-        require(ports==expected_ports or (ports=={} and self.c.get('admin_publish_allow_missing') is True),
-                'World ports must be exposed only by the reviewed admin publication')
+        require(not ports,'World ports must be exposed only by the trusted ingress')
         networks=data.get('NetworkSettings',{}).get('Networks',{})
         require(set(networks)=={self.network},'Unexpected world network')
         network=json.loads(self.docker('network','inspect',self.network,timeout=budget()))[0]
@@ -677,7 +681,7 @@ class Engine:
 
     def container_assets_source(self,cid,release=None,deadline=None):
         """The host directory the running world serves /assets from."""
-        data=self.inspect(cid,timeout=max(.05,min(3,deadline-time.monotonic())) if deadline else 30)
+        data=self.inspect(cid,timeout=max(.05,min(8,deadline-time.monotonic())) if deadline else 30)
         distro=data['Config'].get('Labels',{}).get('desktop.docker.io/wsl-distro','')
         candidates=[self.served_assets]+([Path(release)/'assets'] if release is not None else [])
         for mount in data['Mounts']:
@@ -731,13 +735,13 @@ class Engine:
         return self._base_image
 
     def ingress_id(self):
-        value=self.docker('inspect','--format','{{.Id}}',self.ingress_name).decode().strip()
+        value=self.docker('inspect','--type','container','--format','{{.Id}}',self.ingress_name).decode().strip()
         require(re.fullmatch(r'[0-9a-f]{64}',value),'Trusted ingress container missing')
         return value
 
     def validate_ingress(self,deadline=None,running=True):
         def budget():return max(.05,min(3,deadline-time.monotonic())) if deadline else 15
-        data=json.loads(self.docker('inspect',self.ingress_name,timeout=budget()))[0]
+        data=json.loads(self.docker('inspect','--type','container',self.ingress_name,timeout=budget()))[0]
         host,cfg=data['HostConfig'],data['Config']
         require(data['Image']==self.base_id() and (not running or data['State']['Running']),'Trusted ingress image/state mismatch')
         require(cfg.get('Entrypoint')==['python'] and cfg.get('Cmd')==['-I','-c',PROXY_PROGRAM],'Untrusted ingress program')
@@ -747,14 +751,16 @@ class Engine:
                 'no-new-privileges:true' in (host.get('SecurityOpt') or []),'Unsafe ingress privileges')
         require(not host.get('Devices') and not host.get('DeviceRequests') and host.get('PidMode','')!='host' and host.get('IpcMode','')!='host','Host resources exposed to ingress')
         require(host.get('RestartPolicy',{}).get('Name') in ('no',''),'Unmanaged ingress restart policy')
-        expected={'9443/tcp':[{'HostIp':'127.0.0.1','HostPort':str(self.c['https_port'])}],
-                  '9444/tcp':[{'HostIp':'127.0.0.1','HostPort':str(self.c['game_port'])}]}
-        require(host.get('PortBindings')==expected,'Unsafe ingress port bindings')
+        require(host.get('PortBindings')==self.ingress_bindings(),'Unsafe ingress port bindings')
         require(set(data['NetworkSettings']['Networks'])=={self.network,self.ingress_network},'Unexpected ingress networks')
         return data
 
+    def ingress_bindings(self):
+        return {'9443/tcp':[{'HostIp':'127.0.0.1','HostPort':str(self.c['https_port'])}],
+                '9444/tcp':[{'HostIp':'127.0.0.1','HostPort':str(self.c['game_port'])}]}
+
     def ensure_ingress(self):
-        try:data=json.loads(self.docker('inspect',self.ingress_name))[0]
+        try:data=json.loads(self.docker('inspect','--type','container',self.ingress_name))[0]
         except DeploymentError:data=None
         if data is not None:
             self.validate_ingress(running=False)
@@ -770,7 +776,9 @@ class Engine:
                         '--label','com.docker.compose.project='+self.c['project'],'--label','com.docker.compose.service=ingress',
                         '--read-only','--user','1000:1000','--cap-drop','ALL','--security-opt','no-new-privileges:true',
                         '--restart','no','--pids-limit','128','--memory','128m','--cpus','0.5',
-                        '--publish','127.0.0.1:%s:9443'%self.c['https_port'],'--publish','127.0.0.1:%s:9444'%self.c['game_port'],
+                        *[item for port,binding in self.ingress_bindings().items() for target in binding
+                          for item in ('--publish','%s:%s:%s' % (target['HostIp'],target['HostPort'],
+                                                                 port.split('/')[0]))],
                         '--env','WORLD_TARGET='+self.world_alias,'--entrypoint','python',self.base_id(),'-I','-c',PROXY_PROGRAM).decode().strip()
         try:
             self.docker('network','connect',self.network,cid)
@@ -802,9 +810,6 @@ class Engine:
                  '--cert=/certs/server.crt','--key=/certs/server.key','--assets=/assets','--update-config=/assets/update_config.json',
                  '--asset-origin='+c['asset_origin'],'--deployment-control=/control/socket','--deployment-secret=/control/secret',
                  '--deployment-release='+manifest['commit']]
-        for binding in admin_port_bindings(self.c, enabled).values():
-            for target in binding:
-                args += ['--publish','%s:%s:9445' % (target['HostIp'], target['HostPort'])]
         args+=self.admin.flags(enabled)
         if handoff:args+=['--deployment-id='+handoff]
         timeout=max(.1,deadline-time.monotonic()) if deadline else 30
@@ -907,26 +912,25 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             return event
 
     def same_server(self, release, active):
-        """True when the release runs the same server content and runtime shape."""
+        """True when the release runs the same server content and published shape."""
         try:
-            if server_identity(release) != server_identity(active['release_path']):
-                return False
+            matched = server_identity(release) == server_identity(active['release_path'])
         except (OSError, ValueError, KeyError, DeploymentError):
-            pass
-        else:
-            # A changed publication (for example the reviewed admin port) needs a
-            # container recreation even when the server code is byte-identical.
             try:
-                data=self.inspect(active['container'])
-                enabled=self.admin.enabled(active['container'])
-                return (data['HostConfig'].get('PortBindings') or {})==admin_port_bindings(self.c,enabled)
-            except (OSError, ValueError, KeyError, DeploymentError, AttributeError):
-                return True
-        try:
-            image = json.loads((Path(release)/'manifest.json').read_text()).get('image')
-        except (OSError, ValueError):
+                image = json.loads((Path(release)/'manifest.json').read_text()).get('image')
+            except (OSError, ValueError):
+                return False
+            matched = image is not None and image == active.get('image')
+        if not matched:
             return False
-        return image is not None and image == active.get('image')
+        # A changed publication (for example the reviewed admin port) needs a
+        # container recreation even when the server code is byte-identical.
+        try:
+            data = self.inspect(active['container'])
+            enabled = self.admin.enabled(active['container'])
+            return (data['HostConfig'].get('PortBindings') or {}) == admin_port_bindings(self.c if enabled else {})
+        except (OSError, ValueError, KeyError, DeploymentError, AttributeError):
+            return True
 
     def publish_assets(self, release, expected_tracked):
         """Publish a release's assets onto the running world without restarting it."""
