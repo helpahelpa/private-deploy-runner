@@ -59,8 +59,9 @@ host can reach).
 - To retire Cloudflare's proxying entirely (it keeps only the zone's nameservers)
   and front the game with an operator-owned reverse proxy, follow
   [reverse-proxy-handoff.md](reverse-proxy-handoff.md). The same document covers
-  moving the admin API off the Worker transport; the target state has **no public
-  admin surface**.
+  moving the admin API off the Worker transport: it is published from the world
+  container and served through the same proxy, authenticated only by its admin
+  API key (mTLS / IP allowlist remain optional follow-ups).
 
 ## 5. Private state and secrets
 
