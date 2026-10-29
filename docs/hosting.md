@@ -56,6 +56,9 @@ host can reach).
 - **Outbound 22/443** to GitHub for `git` and the runner.
 - **Cloudflare side** (already configured, see `deploy/cloudflare/README.md`): proxied A record for the gameplay host, SSL mode **Full**, Basic challenge enforced by the gateway for `/client.apk`, and WAF skip rules for non-browser transports.
 - The retired outbound relay needs nothing: no Worker, no Durable Object, no `cloudflared`.
+- To replace Cloudflare with an operator-owned reverse proxy, follow
+  [reverse-proxy-handoff.md](reverse-proxy-handoff.md): same hostname, public TLS at
+  the proxy, origin reached with verification disabled, no content transformation.
 
 ## 5. Private state and secrets
 
