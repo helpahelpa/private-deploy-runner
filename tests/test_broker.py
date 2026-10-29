@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import subprocess
+import types
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import broker
 import pipeline
+import watch_master as watch_master
 
 A, B = "a" * 40, "b" * 40
 TOKEN = "fixture-private-token-" + "x" * 40
@@ -911,47 +913,69 @@ class DocumentationAdoptionTests(unittest.TestCase):
 
 
 class DocumentationClassificationTests(unittest.TestCase):
-    """The broker decides from the private mirror, never from the caller's claim."""
+    """The broker asks GitHub itself and fails towards a real deployment."""
 
     class Registry:
         def tracked(self):
             return A
 
-    def operations(self, diff):
+    class GitHub:
+        def __init__(self, response=None, error=False):
+            self.response, self.error, self.endpoints = response, error, []
+
+        def request(self, endpoint):
+            self.endpoints.append(endpoint)
+            if self.error:
+                raise watch_master.WatchError("GitHub unavailable")
+            return self.response
+
+    def probe(self, *, status='ahead', files=(), commits=1, error=False, sha=B):
+        payload = {'status': status, 'total_commits': commits}
+        if files is not None:
+            payload['files'] = list(files)
+        github = self.GitHub(payload, error)
         operations = object.__new__(broker.Operations)
-        operations.c = {'source_cache': Path('/private/source.git'),
+        operations.c = {'source': types.SimpleNamespace(full_name='example/source'),
                         'engine_config': '/private/engine.json'}
-        operations.fetch_commit = lambda sha: Path('/private/source.git')
-        operations.has_commit = lambda sha: True
-        operations.check_successor = lambda base, sha: None
-        operations.git = lambda *arguments: (diff + '\n').encode()
-        return operations
-
-    def probe(self, diff, sha=B):
+        operations.github = github
         with patch.object(broker.engine, 'Engine', lambda config, _r=self.Registry(): _r):
-            return self.operations(diff).docs_only(sha)
+            result = operations.docs_only(sha)
+        self.endpoints = github.endpoints
+        return result
 
-    def test_documentation_only_diff_is_adoptable(self):
-        self.assertTrue(self.probe('docs/ci-performance.md\ndeploy/cloudflare/README.md'))
+    def test_documentation_only_files_are_adoptable(self):
+        self.assertTrue(self.probe(files=[{'filename': 'docs/ci-performance.md'},
+                                          {'filename': 'deploy/cloudflare/README.md'},
+                                          {'filename': 'README.md'}]))
+        self.assertEqual(['repos/example/source/compare/' + A + '...' + B], self.endpoints)
 
     def test_any_material_path_keeps_the_commit_for_the_pipeline(self):
-        self.assertFalse(self.probe('README.md\nserver/multiplayer_server.py'))
-        self.assertFalse(self.probe('AGENTS.md'))
+        for name in ('AGENTS.md', 'server/multiplayer_server.py', 'deploy/cloudflare/compose.yaml'):
+            with self.subTest(name=name):
+                self.assertFalse(self.probe(files=[{'filename': name}]))
 
-    def test_an_empty_diff_has_nothing_to_build(self):
-        self.assertTrue(self.probe(''))
+    def test_an_identical_tree_has_nothing_to_build(self):
+        self.assertTrue(self.probe(status='identical'))
+
+    def test_history_that_is_not_ahead_is_never_adopted(self):
+        for status in ('behind', 'diverged'):
+            with self.subTest(status=status):
+                self.assertFalse(self.probe(status=status, files=[{'filename': 'docs/a.md'}]))
+
+    def test_a_truncated_comparison_is_never_adopted(self):
+        self.assertFalse(self.probe(files=[{'filename': 'docs/a.md'}], commits=251))
+        self.assertFalse(self.probe(files=[{'filename': 'docs/a.md'}] * 300))
+        self.assertFalse(self.probe(files=None))
+
+    def test_an_unavailable_api_leaves_the_commit_to_the_workflow(self):
+        self.assertFalse(self.probe(error=True))
+        self.assertFalse(self.probe(status='ahead', files=[], commits=1, error=True))
 
     def test_an_invalid_commit_is_rejected(self):
         for sha in ('nope', 'a' * 39, None, True):
             with self.subTest(sha=sha), self.assertRaises(broker.BrokerError):
-                self.probe('docs/a.md', sha=sha)
+                self.probe(sha=sha)
 
-    def test_the_commit_is_fetched_before_ancestry_is_checked(self):
-        calls = []
-        operations = self.operations('docs/a.md')
-        operations.fetch_commit = lambda sha: (calls.append(('fetch', sha)),
-                                               Path('/private/source.git'))[1]
-        operations.check_successor = lambda base, sha: calls.append(('successor', base, sha))
-        with patch.object(broker.engine, 'Engine', lambda config, _r=self.Registry(): _r):
-            self.assertTrue(operations.docs_only(B))
-        self.assertEqual([('fetch', B), ('successor', A, B)], calls)
+    def test_an_already_tracked_commit_needs_no_api_call(self):
+        self.assertTrue(self.probe(sha=A))
+        self.assertEqual([], self.endpoints)

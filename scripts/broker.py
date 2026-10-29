@@ -175,18 +175,38 @@ class Operations:
             return False
 
     def docs_only(self, sha):
-        """True when nothing between the tracked commit and this commit can change a build."""
+        """True when nothing between the tracked commit and this commit can change a build.
+
+        One authenticated GitHub read, because nothing is going to be fetched or
+        built: the pushed commit only enters the private mirror with the next real
+        build. Any doubt - unavailable API, diverged history, a truncated file list -
+        answers False, which leaves the commit to the normal workflow.
+        """
         require(isinstance(sha, str) and SHA.fullmatch(sha))
-        # The registry, not a live health probe: publishing proves the health.
         base = engine.Engine(self.c["engine_config"]).tracked()
         require(isinstance(base, str) and SHA.fullmatch(base))
-        self.fetch_commit(sha)
-        if not self.has_commit(base):
-            self.fetch_commit(base)
-        # Ancestry and the operator alias rule need both commits in the mirror.
-        self.check_successor(base, sha)
-        output = self.git("--git-dir=" + str(self.c["source_cache"]), "diff", "--name-only", base, sha).decode()
-        return not component_inputs.material([line for line in output.splitlines() if line])
+        if sha == base:
+            return True
+        try:
+            value = self.github.request(
+                f"repos/{self.c['source'].full_name}/compare/{base}...{sha}")
+        except watch.WatchError:
+            return False
+        if not isinstance(value, dict):
+            return False
+        if value.get('status') == 'identical':
+            return True
+        if value.get('status') != 'ahead':
+            return False
+        files, commits = value.get('files'), value.get('total_commits')
+        # GitHub truncates the comparison: an incomplete list is never documentation-only.
+        if not isinstance(files, list) or type(commits) is not int or commits > 250 or len(files) >= 300:
+            return False
+        names = []
+        for item in files:
+            require(isinstance(item, dict) and isinstance(item.get('filename'), str))
+            names.append(item['filename'])
+        return not component_inputs.material(names)
 
     def preflight(self):
         # Configuration errors must fail before any compiler or test container
