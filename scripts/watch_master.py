@@ -580,6 +580,9 @@ class Watcher:
             self.state["deployed_sha"] = latest
             self.state["inflight"] = None
             self.state["failures"].pop(latest, None)
+            # An earlier failed run of this commit is history: adoption is current.
+            if (self.state.get("latest_run_outcome") or {}).get("sha") == latest:
+                self.state["latest_run_outcome"] = None
             self.save()
             self.status(latest, "docs")
             return "adopted"

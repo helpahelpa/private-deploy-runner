@@ -693,3 +693,14 @@ class DocumentationAdoptionTests(unittest.TestCase):
         self.assertFalse(self.github.dispatches)
         self.assertEqual(self.watcher.state["deployed_sha"], A)
         self.assertNotIn(A, self.watcher.state["failures"])
+
+
+    def test_adoption_clears_an_earlier_failed_run_of_the_same_commit(self):
+        self.github.run(status='completed', conclusion='failure')
+        self.bind_attempt() if hasattr(self, 'bind_attempt') else None
+        state = watch.read_state(self.path)
+        state['latest_run_outcome'] = {'sha': A, 'run_id': 101, 'attempt': 1, 'conclusion': 'failure'}
+        watch.save_state(self.path, state)
+        self.watcher = watch.Watcher(self.config, self.github, lambda: 1735689600.0)
+        self.assertEqual(self.watcher.tick(), "adopted")
+        self.assertEqual(self.watcher.tick(), "current")
