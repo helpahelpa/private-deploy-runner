@@ -1,213 +1,212 @@
-# Handoff: front the game origin with an operator-controlled reverse proxy
+# Handoff: exit Cloudflare (DNS only) and front everything with a reverse proxy
 
-Audience: the agent/operator who will stand up the proxy. This replaces
-Cloudflare as the public entry point for the **game** hostname. It does not
-change the client, the origin server code, or the APK.
+Audience: the agent/operator who will stand up the proxy and retire Cloudflare's
+proxy/Workers. Target end state:
 
-Read §2 before choosing a design: several of those points are hard requirements
-enforced by the shipped Android client, not preferences.
+- **Cloudflare keeps only the zone's nameservers** — no proxying, no Workers, no
+  WAF, no Origin Pulls, no `100::` placeholder records.
+- **One operator-owned reverse proxy** terminates TLS for the game hostname and
+  forwards to the origin machine.
+- **The admin API becomes private** (loopback + Tailscale/SSH), so nothing
+  administrative is publicly reachable at all.
+
+Read §2 before choosing a design: those points are enforced by the shipped
+Android client.
 
 ---
 
 ## 1. Target picture
 
 ```
-phone / BlueStacks
-      │  TLS  (publicly trusted certificate for raidshadowlegendstipsandtricks.kdns.fr)
-      ▼
-reverse proxy  ──►  origin host :443  (the existing public edge container)
-(VPS w/ public IP)      TLS to origin with verification DISABLED
+phone / BlueStacks                       operator
+      │ TLS (public CA)                      │ TLS (public CA) or Tailscale/SSH
+      ▼                                      ▼
+reverse proxy ──► origin :443        (admin: 127.0.0.1:9445 on the origin host)
+(VPS, public IP)      the existing public edge container
 ```
 
-Cloudflare is removed from the game path. `admin.raidshadowlegendstipsandtricks.kdns.fr`
-is *separate* (its admin transport is an outbound-443 Worker path); leave it on
-Cloudflare unless a later task moves it too.
+Cloudflare resolves `raidshadowlegendstipsandtricks.kdns.fr` to the proxy and
+holds the zone's NS records. Nothing else.
 
 ## 2. Client contract (non-negotiable)
 
-The hostname is compiled into the installed APKs — `assets_origin` and
+The hostname is compiled into every installed APK — `assets_origin` and
 `gameplay_url` are `https://raidshadowlegendstipsandtricks.kdns.fr` and
-`wss://raidshadowlegendstipsandtricks.kdns.fr/game`. **Do not change the
-hostname**, or every installed client breaks.
+`wss://raidshadowlegendstipsandtricks.kdns.fr/game`. **Do not change the hostname.**
 
 | Requirement | Why |
 |---|---|
-| TLS on 443 with a **publicly trusted** certificate for that hostname | `Tls.systemContext()` validates against the platform trust store. The origin's own certificate is signed by the project CA with `CN=localhost`, so it can never be presented to clients |
-| Pass `Authorization` through untouched | `/client.apk` is protected by **Basic auth enforced at the origin** (401 + `WWW-Authenticate: Basic realm="APK download"`). The proxy must not terminate, strip or "handle" it |
-| No content transformation on `/client.apk` | the client requires `Content-Length` to equal `size` from `apk-update.json` (**170214271** today) and rejects `Content-Encoding` other than `identity`. So: no gzip/brotli, no chunked re-encoding, no size rewriting |
-| Stream, do not buffer, large bodies | 170 MB installer; the client has a **15-second read timeout per read**, so any proxy stall aborts the download. Disable response buffering for `/client.apk` |
-| WebSocket upgrade on `/game`, long-lived | gameplay runs over WSS on that path; upstream idle budget is 1800 s. Preserve `Upgrade`/`Connection`; set read/idle timeouts ≥ 1800 s; binary frames, no buffering |
-| Do not cache authenticated responses | if caching is enabled, key on `Authorization` and never store the 401 |
+| TLS on 443 with a **publicly trusted** certificate | the client validates against the platform trust store; the origin's own certificate is project-CA with `CN=localhost` and can never be shown to clients |
+| Pass `Authorization` through untouched | `/client.apk` is protected by **Basic auth at the origin** (401 + `WWW-Authenticate: Basic realm="APK download"`) |
+| No content transformation on `/client.apk` | the client requires `Content-Length == size` from `apk-update.json` (**170214271** today) and rejects `Content-Encoding` other than `identity`: no gzip/brotli, no chunked re-encoding |
+| Stream, do not buffer | 170 MB installer, and the client has a **15 s read timeout per read**; any stall aborts the download |
+| WebSocket upgrade on `/game`, long-lived | preserve `Upgrade`/`Connection`, idle ≥ 1800 s, no buffering |
+| Never cache authenticated responses | if caching is enabled at all, key on `Authorization` and never store a 401 |
 | Public paths stay public | `/healthz`, `/apk-update.json`, `/Android_*/UpdateRoot/*`, `/Other/dev.txt`, `/ForceUpdateAddress/*` |
 
-Request methods are `GET`/`HEAD` only, no request bodies.
+Methods are `GET`/`HEAD`; no request bodies.
 
-## 3. What to proxy (and what not)
+## 3. What the origin exposes
 
-The origin exposes exactly one listener, the public edge container
-(`mhsy-main-edge-public-gateway-1`, published on `<origin-lan-ip>:443`):
+One listener only: the public edge container
+(`mhsy-main-edge-public-gateway-1`, published on `<origin-lan-ip>:443`).
 
-| Path | Upstream behaviour |
+| Path | Behaviour |
 |---|---|
-| `/game` | 101 Switching Protocols, bridged to the world game port |
-| `/client.apk` | 401 without Basic credentials, 200 + 170 MB with them |
-| `/apk-update.json`, `/Other/dev.txt`, `/Android_90/UpdateRoot/...`, `/ForceUpdateAddress/...` | 200, small bodies |
+| `/game` | 101 Switching Protocols → world game port |
+| `/client.apk` | 401 without credentials, 200 + 170 MB with them |
+| `/apk-update.json`, `/Other/dev.txt`, `/Android_90/UpdateRoot/...`, `/ForceUpdateAddress/...` | 200 (small) |
 | `/healthz` | 200 `ok` |
-| anything else | 404 |
+| other | 404 |
 
-Everything else on the origin host is loopback-only (world 9443/9444 via ingress
-19543/19544, DEV stack 19443/19444, broker socket, runner) and must **not** be
-exposed. The legacy Main server on `0.0.0.0:9001` is LAN-only and unrelated.
+Loopback-only (must stay unexposed): world 9443/9444 via ingress 19543/19544,
+DEV stack 19443/19444, admin API 9445, broker socket/token, GitHub runner.
+The legacy Main server on `0.0.0.0:9001` is LAN-only and unrelated.
 
 ## 4. Reach the origin
 
-Two supported options:
+- **A. Direct** — upstream `https://<origin-public-ip>:443`. The router already
+  forwards TCP 443, so this works today.
+- **B. Tunnel** — WireGuard/Tailscale between proxy and origin, upstream
+  `https://<tunnel-ip>:443`. Required if the origin has no routable address, and
+  preferred if you do not want the origin reachable at its own IP.
+  Cloudflare Tunnel is not an option: this network only permits outbound 443 and
+  the tunnel needs 7844.
 
-- **A. Direct (preferred if the origin has a routable address).** Upstream `https://<origin-public-ip>:443`.
-  The router currently forwards TCP 443 to the origin host, so this works today.
-- **B. Tunnel (if the origin is behind CGNAT or you refuse to expose it).** WireGuard
-  (or Tailscale) between the proxy host and the origin host; upstream
-  `https://<tunnel-ip>:443`. Cloudflare Tunnel is **not** an option here: this
-  network only permits outbound 443 and the tunnel needs 7844.
-
-Upstream TLS always uses **verification disabled** (self-signed, `CN=localhost`);
-the proxy is the only party that must present a valid public certificate.
+Upstream TLS is always **verification disabled** (self-signed, `CN=localhost`).
 
 ## 5. Reference implementation (Caddy)
 
-Install Caddy 2 on the proxy host, DNS A record already pointing at it, then:
-
 ```caddyfile
 raidshadowlegendstipsandtricks.kdns.fr {
-    encode off                                  # never compress: APK size/content-length
+    encode off                                  # never compress: APK length/encoding
     @apk path /client.apk
     header @apk Cache-Control "no-store, no-transform"
 
     reverse_proxy https://<ORIGIN>:443 {
         transport http {
-            tls_insecure_skip_verify            # origin cert is private-CA/CN=localhost
-            read_timeout 35m                    # installer + long WSS
+            tls_insecure_skip_verify            # origin cert is private-CA
+            read_timeout 35m
             write_timeout 35m
         }
         flush_interval -1                       # stream, never buffer
-        # Basic auth and Content-Length pass through untouched
     }
 }
 ```
 
-nginx alternative (key directives only):
+nginx equivalent (key directives): `gzip off;` `proxy_ssl_verify off;`
+`proxy_buffering off;` `proxy_request_buffering off;` `proxy_read_timeout 1800s;`
+`proxy_send_timeout 1800s;` `proxy_http_version 1.1;` plus
+`proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $connection_upgrade;`
+and `proxy_set_header Authorization $http_authorization;`.
 
-```nginx
-server {
-  listen 443 ssl http2;
-  server_name raidshadowlegendstipsandtricks.kdns.fr;
-  ssl_certificate     /etc/letsencrypt/live/.../fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/.../privkey.pem;
+Certificates: the zone stays at Cloudflare, so **DNS-01 with a Cloudflare API
+token** (`Zone:DNS:Edit`) is the simplest; HTTP-01 on port 80 works after the
+record points at the proxy.
 
-  gzip off;
+## 6. Admin: replace the Worker transport
 
-  location / {
-    proxy_pass https://<ORIGIN>:443;
-    proxy_ssl_verify off;
-    proxy_set_header Host $host;
-    proxy_set_header Authorization $http_authorization;   # keep Basic for /client.apk
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection $connection_upgrade;
-    proxy_buffering off;
-    proxy_request_buffering off;
-    proxy_read_timeout 1800s;
-    proxy_send_timeout 1800s;
-  }
-}
-map $http_upgrade $connection_upgrade { default upgrade; '' close; }
-```
+Today the admin API is `127.0.0.1:9445` inside the world container, reached by an
+outbound-443 **Cloudflare Worker + Durable Object** via
+`mhsy-main-world-admin-relay` (agent) and `mhsy-main-admin-egress` (a SOCKS shim
+that allowlists only `admin.raidshadowlegendstipsandtricks.kdns.fr`). The admin
+hostname is a Worker custom domain backed by an `AAAA 100::` placeholder record.
 
-Certificates: the hostname's DNS is in Cloudflare, so either use **DNS-01** with
-a Cloudflare API token scoped to `Zone:DNS:Edit`, or point the record at the proxy
-first and use **HTTP-01** on port 80.
+All of that depends on Cloudflare proxying and dies with it. Pick one:
 
-## 6. DNS cutover
+**Option A — recommended: admin becomes private.**
 
-1. Lower the record's TTL to 60 s and wait one TTL.
-2. Change the `A` record for `raidshadowlegendstipsandtricks.kdns.fr` from the
-   proxied (orange-cloud) entry to the **proxy's public IP with proxying OFF**
-   (DNS only). Cloudflare then serves DNS only.
-3. Keep `admin.raidshadowlegendstipsandtricks.kdns.fr` untouched.
-4. Verify (below) before removing anything else. Do **not** delete the Cloudflare
-   Worker or its route until the new path has run for a day — it is the rollback.
+1. Stop and remove `mhsy-main-world-admin-relay` and `mhsy-main-admin-egress`.
+2. Publish the admin API on the origin host's loopback only
+   (engine `start()`: `--publish 127.0.0.1:<admin-port>:9445`).
+3. Reach it locally with `tools/mhsy_admin.py` against `https://127.0.0.1:<admin-port>`,
+   remotely over Tailscale (bind that port on the tailnet address) or
+   `ssh -L <admin-port>:127.0.0.1:<admin-port> origin-host`.
+4. Delete the `admin.raidshadowlegendstipsandtricks.kdns.fr` record and the
+   Worker custom domain.
 
-## 7. Origin-side changes
+Result: no public admin surface at all — strictly better than today.
 
-- Keep the public edge container running; it is the upstream.
-- Once the proxy is verified, close the router's inbound 443 forward if the proxy
-  reaches the origin over a tunnel (option B). With option A the forward stays,
-  which means the origin remains directly reachable — see §9.
-- Nothing in the game repo, APK, or deployment pipeline changes.
+**Option B — only if remote admin without VPN is a requirement.** Route
+`admin.raid…` through the same reverse proxy to a published admin listener,
+protected by a proxy-side source-IP allowlist (operator addresses only) **and**
+mTLS **and** the existing per-admin API key. This deliberately re-exposes the
+admin API; do not do it without all three.
 
-## 8. Verification (run from a network outside the origin's LAN)
+## 7. Cutover order
+
+1. Recruit the proxy in parallel with Cloudflare: it must answer correctly for
+   the hostname before DNS changes (test with `curl --resolve`).
+2. Lower the game record's TTL to 60 s, wait one TTL.
+3. Flip the game record: `A → <proxy public IP>`, **proxying off** (DNS only).
+4. Apply the admin decision from §6.
+5. Verify everything in §8.
+6. Only then retire Cloudflare's proxy features (§9).
+
+## 8. Verification (run from outside the origin's LAN)
 
 ```sh
 H=raidshadowlegendstipsandtricks.kdns.fr
 
-# 1. Certificate is publicly trusted and matches the hostname
-openssl s_client -connect $H:443 -servername $H -verify_return_error </dev/null 2>&1 | grep -E "Verify return code|subject="
-
-# 2. Public metadata matches the published installer
-curl -s https://$H/apk-update.json | jq '{version_code, size, sha256, url}'
-#   expect size 170214271 and url "/client.apk"
-
-# 3. Challenge is enforced at the origin and preserved by the proxy
-curl -sI https://$H/client.apk | grep -iE "HTTP/|www-authenticate"     # 401 + Basic realm
-
-# 4. Authenticated download: exact length, no encoding, complete body
+openssl s_client -connect $H:443 -servername $H -verify_return_error </dev/null 2>&1 | grep "Verify return code"
+curl -s https://$H/apk-update.json | jq '{version_code, size, sha256, url}'   # size 170214271, url /client.apk
+curl -sI https://$H/client.apk | grep -iE "HTTP/|www-authenticate"           # 401 + Basic realm
 curl -s -u "$APK_USER:$APK_PASS" -D - -o /tmp/client.apk https://$H/client.apk \
-  | grep -iE "HTTP/|content-length|content-encoding"
-#   expect 200, content-length: 170214271, NO content-encoding
-sha256sum /tmp/client.apk   # must equal apk-update.json sha256
-
-# 5. Game socket upgrades and stays up
-#   (any WS client) GET /game with Upgrade: websocket -> 101, then hold 5 minutes
-
-# 6. Assets
+  | grep -iE "HTTP/|content-length|content-encoding"                          # 200, 170214271, NO content-encoding
+sha256sum /tmp/client.apk                                                    # equals metadata sha256
+curl -s -o /dev/null -w '%{http_code}\n' https://$H/healthz                  # 200
 curl -s -o /dev/null -w '%{http_code}\n' https://$H/Android_90/UpdateRoot/Version/Version.bytes
-curl -s -o /dev/null -w '%{http_code}\n' https://$H/Other/dev.txt
+# WebSocket: GET /game + Upgrade: websocket -> 101, hold 5 minutes
 ```
 
-Then in the real client: launch the game on a phone over mobile data, log in, enter
-the city, and run one update check (it must offer no update and download nothing).
+Then: launch the real client on a phone over mobile data, log in, enter the city,
+run an update check (nothing to download). Confirm **no `cf-ray`** header appears
+anywhere, and that `admin.raid…` no longer resolves publicly (Option A).
 
-The origin's own Basic credential lives only on the origin host
-(`local/startup-apk-download/credentials.private.json`); the proxy does not need it.
+## 9. Retiring Cloudflare's proxy features
 
-## 9. Known pitfalls (learned the hard way)
+Order matters; do this after §8 passes.
 
-- **15-second client read timeout** — a proxy that buffers or stalls breaks the
-  installer. Stream everything on `/client.apk`.
-- **Compression** changes `Content-Length` or adds `Content-Encoding`; the client
-  rejects both. `encode off` / `gzip off` is mandatory.
-- **Chunked re-encoding** also drops `Content-Length`; do not let the proxy
-  re-chunk a body that upstream sent with a length.
-- **Caching + Basic auth**: if you enable any cache, key on `Authorization` and
-  never cache 401 — otherwise the APK leaks to unauthenticated clients.
-- **WebSocket timeouts**: defaults of 60 s kill gameplay. Raise idle/read to ≥ 1800 s.
-- **Direct origin exposure**: with option A the origin stays reachable at its own
-  IP:443, bypassing the proxy. Scope the origin firewall to the proxy's IP (and
-  Cloudflare's ranges if you keep Cloudflare) so only the proxy reaches it.
-- **Do not change the hostname**; the APK has it baked in. A rename requires
-  shipping a new APK first.
+1. DNS: every remaining record must be **DNS only** (grey cloud). Keep the zone
+   and its NS records — that is all Cloudflare will do.
+2. Delete the game Worker custom domain (already removed) and the admin one:
+   `mhsy-main-admin-outbound443`.
+3. Delete the Worker scripts: `mhsy-private-relay`, `mhsy-main-admin-outbound443`.
+   Both are reproducible from this repository (`deploy/cloudflare/*.mjs`), so they
+   remain a rollback if the files are kept.
+4. Delete the two WAF custom rules in the ruleset "Scoped non-browser API
+   exceptions" (they skipped BIC/security level/WAF for the two hostnames; inert
+   once nothing is proxied, but remove them so the zone is clean).
+5. Delete the `AAAA 100::` placeholder record for the admin hostname if it survives.
+6. Keep the Cloudflare API token (used for DNS-01 and nothing else).
 
-## 10. Rollback
+Known trap: a `proxied=true` record on a hostname whose Worker custom domain you
+just deleted returns Cloudflare errors instead of reaching your proxy. Flip
+proxying off **before** deleting the custom domain.
 
-Re-point the DNS record back to Cloudflare (proxied) and restore the previous
-router forward if it was changed. The origin edge, Cloudflare Worker route, and
-WAF skip rules are left in place for exactly this reason; nothing on the origin
-needs to be re-created.
+## 10. Pitfalls
 
-## 11. Decisions the human must make
+- **15 s client read timeout** — buffering or stalling proxies break the installer.
+- **Compression / chunked re-encoding** — breaks the exact `Content-Length` check.
+- **Caching + Basic auth** — would leak the APK to unauthenticated clients.
+- **WebSocket timeouts** — 60 s defaults kill gameplay; use ≥ 1800 s.
+- **Origin exposure** — with §4 A the origin is still reachable at its own IP:443;
+  scope the origin firewall to the proxy (and drop the router forward if you use
+  a tunnel).
+- **Private-CA origin cert** — never present it to clients; terminate at the proxy.
+- **Hostname is baked into APKs** — a rename requires shipping a new APK first.
 
-1. Which proxy host (VPS provider/IP) and whether it reaches the origin directly
-   (§4 A) or over a tunnel (§4 B).
-2. ACME method: DNS-01 with a Cloudflare API token, or HTTP-01 after DNS cutover.
-3. Whether the origin firewall becomes proxy-only, Cloudflare-only, or both.
-4. Whether `admin.raid…` also moves off Cloudflare later (out of scope here).
+## 11. Rollback
+
+Re-enable proxying on the game record and recreate its Worker custom domain
+(the Worker script is in `deploy/cloudflare/`), then restore the relay containers
+with `docker compose --profile relay up -d`. The origin edge and its Basic auth
+never change, so no origin work is needed in either direction.
+
+## 12. Decisions the human must make
+
+1. Proxy host (VPS/IP) and whether it reaches the origin directly (§4 A) or over
+   a tunnel (§4 B).
+2. ACME method: DNS-01 with a scoped Cloudflare token, or HTTP-01.
+3. Admin: private (Option A, recommended) or proxied with IP allowlist + mTLS
+   + API key (Option B).
