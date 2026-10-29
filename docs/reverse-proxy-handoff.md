@@ -11,6 +11,13 @@ proxy/Workers. Target end state:
   by its per-admin API key (explicit human decision for now). The
   Worker/Durable-Object transport and its loopback-only assumptions are retired.
 
+**Status at handoff (2026-10-29):** Cloudflare is now DNS only. Both
+`raid…` and `admin.raid…` are grey-cloud `A` records pointing at the proxy
+(`135.106.193.31`, TTL 60); the two Worker scripts, both Worker custom domains,
+the WAF skip rules and the `AAAA 100::` placeholder are deleted. The game hostname
+verifies end to end through the proxy; **the admin hostname still needs its site
+block on the proxy** (§6).
+
 Read §2 before choosing a design: those points are enforced by the shipped
 Android client.
 
@@ -109,55 +116,41 @@ Certificates: the zone stays at Cloudflare, so **DNS-01 with a Cloudflare API
 token** (`Zone:DNS:Edit`) is the simplest; HTTP-01 on port 80 works after the
 record points at the proxy.
 
-## 6. Admin: move off the Worker transport
+## 6. Admin: served by the origin gateway, one site block left on the proxy
 
-Today the admin API binds **loopback only inside the world container**
-(`admin_api.py` refuses any other host on purpose) and is reached by an
-outbound-443 **Cloudflare Worker + Durable Object** through
-`mhsy-main-world-admin-relay` (agent) and `mhsy-main-admin-egress` (a SOCKS shim
-allowlisting only `admin.raid…`). The admin hostname is a Worker custom domain
-backed by an `AAAA 100::` placeholder record. All of that depends on Cloudflare
-proxying and stops working when the zone becomes DNS-only.
+The admin API used to sit behind a Worker custom domain and an outbound relay
+agent. That is retired. The origin now carries the admin route itself:
 
-**Chosen design:** the reverse proxy fronts `admin.raid…` and forwards to the
-admin API on the origin. Authentication is the per-admin API key (no mTLS, no IP
-allowlist for now — explicit human decision). Consequences to keep in mind:
+```
+admin.raid…  ──►  proxy :443  ──►  origin :443 (public edge gateway)
+                                        │  Host: admin.raid… → admin upstream
+                                        ▼
+                                   ingress :9445 ──► world 0.0.0.0:9445
+                                   (admin API, loopback-bound by default,
+                                    bound to the container network only when
+                                    the reviewed publication is configured)
+```
 
-- The admin API becomes publicly reachable for the first time. Its surface is
-  bounded by design (REST only: no shell, SQL, files or backup/restore), and every
-  request must present an admin API key.
-- Use a long random key, rotate it, and add proxy-side rate limiting on that
-  hostname. An IP allowlist or mTLS remains the cheapest upgrade if this ever
-  needs tightening.
+Origin-side pieces already in place:
 
-### Origin-side prerequisites
+- `engine.private.json`: `admin_public_port: 9445` makes the deployment pass
+  `--admin-bind=0.0.0.0` to the world, so the admin API listens on the container
+  network (never on a host interface; nothing is published).
+- the ingress forwards `9445` to the world (its `PROXY_PROGRAM` binds 9443, 9444
+  and 9445 internally);
+- the public edge gateway is started with
+  `--admin-host=admin.raidshadowlegendstipsandtricks.kdns.fr --admin-destination=mhsy-main-world-ingress:9445`
+  and forwards any request for that host verbatim, including the admin API key.
 
-Keep the loopback invariant inside the container; publish it instead.
-
-1. **Publish the admin port from the world container** on an address the proxy can
-   reach (the tunnel address under §4 B, or the LAN/public address under §4 A).
-   This is a small change in `scripts/deploy_engine.py → Engine.start()`: when admin
-   is enabled, add `--publish <admin-publish-address>:<admin-public-port>:9445`
-   beside the existing ingress publishes. Suggested config keys:
-   `admin_publish_address` (default `127.0.0.1`) and `admin_public_port`
-   (default `9445`).
-2. Ship that engine change through the normal pipeline (one release, one handoff
-   restart) **before** flipping DNS.
-3. **Do not** relax `admin_api.py`'s loopback check — publishing keeps the API
-   itself bound to loopback and puts the exposure decision in one place.
-4. Firewall the published port to the proxy's address only (tunnel or proxy IP).
-
-### Proxy configuration
+**Remaining step on the proxy host** — add the second site. No new port, no
+router change:
 
 ```caddyfile
 admin.raidshadowlegendstipsandtricks.kdns.fr {
     encode off
-    rate_limit {                       # optional but recommended
-        zone admin { key {remote_host} events 60 window 1m }
-    }
-    reverse_proxy https://<ORIGIN>:<admin-public-port> {
+    reverse_proxy https://<ORIGIN>:443 {
         transport http {
-            tls_insecure_skip_verify   # admin API presents the project-CA certificate
+            tls_insecure_skip_verify      # origin edge presents the project-CA cert
             read_timeout 5m
         }
         flush_interval -1
@@ -165,26 +158,25 @@ admin.raidshadowlegendstipsandtricks.kdns.fr {
 }
 ```
 
-The `Authorization` header (the admin API key) must pass through untouched; the
-proxy adds no auth of its own in this iteration.
+Then verify (the certificate for the admin name is issued by the same ACME run):
 
-### Retire
+```sh
+A=admin.raidshadowlegendstipsandtricks.kdns.fr
+curl -s -o /dev/null -w '%{http_code}\n' https://$A/api/v1/whoami                 # 401
+curl -s -H "Authorization: Bearer $ADMIN_KEY" https://$A/api/v1/whoami            # 200
+mhsy_admin whoami --endpoint https://$A
+```
 
-- Delete the `admin.raid…` Worker custom domain and its `AAAA 100::` record.
-- Delete the Worker script `mhsy-main-admin-outbound443`.
-- Stop and remove `mhsy-main-world-admin-relay` and `mhsy-main-admin-egress`
-  (and their compose/systemd units) once the proxy path is verified.
+Until that block exists the admin hostname resolves but its TLS handshake fails
+(no certificate for that SNI). The admin API is authenticated only by its per-admin
+API key — the operator's explicit choice for now; an IP allowlist or mTLS remains
+the cheap upgrade.
 
 ## 7. Cutover order
 
-1. Recruit the proxy in parallel with Cloudflare: it must answer correctly for
-   the hostname before DNS changes (test with `curl --resolve`).
-2. Lower the game record's TTL to 60 s, wait one TTL.
-3. Flip the game record: `A → <proxy public IP>`, **proxying off** (DNS only).
-4. Verify the admin path through the proxy (the origin publish from §6 must
-   already be deployed).
-5. Verify everything in §8.
-6. Only then retire Cloudflare's proxy features (§9).
+Done: the game record was flipped to `A → proxy`, proxying off, verified, and
+Cloudflare's proxy features retired (§9). Remaining: the admin site block in §6,
+then the admin checks in §8.
 
 ## 8. Verification (run from outside the origin's LAN)
 
@@ -214,9 +206,9 @@ Then: launch the real client on a phone over mobile data, log in, enter the city
 run an update check (nothing to download). Confirm **no `cf-ray`** header appears
 anywhere, and that both hostnames resolve to the proxy, not to Cloudflare.
 
-## 9. Retiring Cloudflare's proxy features
+## 9. Retiring Cloudflare's proxy features — done
 
-Order matters; do this after §8 passes.
+Recorded for reference; this is the completed state.
 
 1. DNS: every remaining record must be **DNS only** (grey cloud). Keep the zone
    and its NS records — that is all Cloudflare will do.

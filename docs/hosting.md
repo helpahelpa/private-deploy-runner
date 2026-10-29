@@ -58,10 +58,11 @@ host can reach).
 - The retired outbound relay needs nothing: no Worker, no Durable Object, no `cloudflared`.
 - To retire Cloudflare's proxying entirely (it keeps only the zone's nameservers)
   and front the game with an operator-owned reverse proxy, follow
-  [reverse-proxy-handoff.md](reverse-proxy-handoff.md). The same document covers
-  moving the admin API off the Worker transport: it is published from the world
-  container and served through the same proxy, authenticated only by its admin
-  API key (mTLS / IP allowlist remain optional follow-ups).
+  [reverse-proxy-handoff.md](reverse-proxy-handoff.md). Cloudflare is now DNS only:
+  both hostnames are grey-cloud records pointing at the proxy. The admin API is
+  reached through the same origin edge on 443 (Host-routed by the gateway to the
+  ingress and the world), authenticated only by its admin API key; mTLS or an IP
+  allowlist remain optional follow-ups.
 
 ## 5. Private state and secrets
 
