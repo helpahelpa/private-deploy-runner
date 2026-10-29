@@ -141,8 +141,8 @@ class GitHub:
 
 
 def initial_state():
-    return {"version": 1, "deployed_sha": None, "inflight": None, "failures": {},
-            "last_deployment_run_id": None, "commit_statuses": {}}
+    return {"version": 1, "deployed_sha": None, "adopted_sha": None, "inflight": None,
+            "failures": {}, "last_deployment_run_id": None, "commit_statuses": {}}
 
 
 def read_state(path):
@@ -157,6 +157,9 @@ def read_state(path):
             raise ValueError()
         deployed = value["deployed_sha"]
         if deployed is not None and not SHA.fullmatch(deployed):
+            raise ValueError()
+        adopted = value.setdefault("adopted_sha", None)
+        if adopted is not None and not SHA.fullmatch(adopted):
             raise ValueError()
         last_run = value.setdefault("last_deployment_run_id", None)
         if last_run is not None and (type(last_run) is not int or last_run <= 0 or deployed is None):
@@ -549,6 +552,7 @@ class Watcher:
                                     or self.binding(run["id"], run.get("run_attempt", 1)) == inflight["sha"])
                 if run["conclusion"] == "success" and verified_attempt:
                     self.state["deployed_sha"] = inflight["sha"]
+                    self.state["adopted_sha"] = None
                     self.state["last_deployment_run_id"] = run["id"]
                     if self.config.attempt_bindings is not None:
                         self.state["last_deployment_run_attempt"] = run.get("run_attempt", 1)
@@ -570,10 +574,9 @@ class Watcher:
             outcome = self.state.get("latest_run_outcome")
             if outcome and outcome["sha"] == latest and outcome["conclusion"] == "failure":
                 return "latest_deployment_failed"
-            published = self.state.get("commit_statuses", {}).get(latest, {}).get("body", {})
             if (self.state["last_deployment_run_id"] is not None
-                    and published.get("description") != STATUS_DESCRIPTIONS["docs"]):
-                # An adopted commit keeps its own outcome; there is no run to point at.
+                    and self.state.get("adopted_sha") != latest):
+                # An adopted commit keeps its own outcome: there is no run to point at.
                 self.status(latest, "success", self.state["last_deployment_run_id"])
             return "current"
         # Adoption is decided by the broker and cannot be blocked by an earlier
@@ -581,6 +584,7 @@ class Watcher:
         # documentation-only commit from being adopted.
         if self.adopt(latest):
             self.state["deployed_sha"] = latest
+            self.state["adopted_sha"] = latest
             self.state["inflight"] = None
             self.state["failures"].pop(latest, None)
             # An earlier failed run of this commit is history: adoption is current.

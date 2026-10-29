@@ -714,3 +714,15 @@ class DocumentationAdoptionTests(unittest.TestCase):
         restarted = watch.Watcher(self.config, self.github, lambda: 1735689600.0)
         self.assertEqual(restarted.tick(), "current")
         self.assertEqual(self.github.statuses[-1][1]["description"], watch.STATUS_DESCRIPTIONS["docs"])
+
+
+    def test_a_later_deployment_takes_over_from_the_adoption(self):
+        self.assertEqual(self.watcher.tick(), "adopted")
+        self.assertEqual(self.watcher.state["adopted_sha"], A)
+        self.github.sha = B
+        self.assertEqual(self.watcher.tick(), "dispatched")
+        run = self.github.run(sha=B)
+        run.update(status="completed", conclusion="success")
+        self.assertEqual(self.watcher.tick(), "current")
+        self.assertIsNone(self.watcher.state["adopted_sha"])
+        self.assertEqual(self.watcher.state["deployed_sha"], B)
