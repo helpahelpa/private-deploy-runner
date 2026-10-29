@@ -51,7 +51,11 @@ host can reach).
 
 ## 4. Network
 
-- **Inbound TCP 443** from Cloudflare to the public edge. No UDP. Router forwards 443 to the host; bind the published port to the LAN address when another service owns 443 elsewhere.
+- **No inbound ports.** The public edge is published on loopback only
+  (`PUBLIC_BIND=127.0.0.1`) and the reverse proxy reaches it over the tailnet
+  (`tailscale serve --bg --tcp=10443 tcp://127.0.0.1:443` → `https://<origin-tailnet-ip>:10443`).
+  There is no router forward and nothing on the public Internet; see
+  [reverse-proxy-handoff.md](reverse-proxy-handoff.md) §4 B.
 - **Outbound 443**: Cloudflare (edge/admin/game), GitHub (runner, repos), `cf` CLI when used.
 - **Outbound 22/443** to GitHub for `git` and the runner.
 - **Cloudflare side** (already configured, see `deploy/cloudflare/README.md`): proxied A record for the gameplay host, SSL mode **Full**, Basic challenge enforced by the gateway for `/client.apk`, and WAF skip rules for non-browser transports.

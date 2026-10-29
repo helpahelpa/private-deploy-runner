@@ -85,6 +85,31 @@ The legacy Main server on `0.0.0.0:9001` is LAN-only and unrelated.
   Cloudflare Tunnel is not an option: this network only permits outbound 443 and
   the tunnel needs 7844.
 
+**The tunnel path is live and is now the only path (2026-10-29).** No new port is
+published by Docker — Docker Desktop will not publish a second host IP for one
+container. Instead `tailscaled` on the origin host forwards raw TCP to the edge
+listener, on the same pattern as the host's other `serve --tcp` forwards:
+
+```sh
+# on the origin host (tailnet 100.96.251.76)
+tailscale serve --bg --tcp=10443 tcp://127.0.0.1:443
+```
+
+Proxy upstream: **`https://100.96.251.76:10443`**, unchanged `tls_insecure_skip_verify`
+(raw TCP, so the origin's project-CA cert is what the proxy sees). Port 10443
+because tailnet 443 on that host is already owned by `tailscale serve` (operator
+dashboard).
+
+Cutover done: the edge is published on **loopback only** (`PUBLIC_BIND=127.0.0.1`),
+so nothing listens on the LAN address or the public IP, and the router's TCP 443
+forward is retired (§4 A no longer exists). If the forward rule is still present
+on the router it is inert — delete it so a future LAN bind cannot re-expose the
+edge. Verified after the cutover: `/healthz` 200, `/game` 101 held idle 70 s,
+assets 200, `/client.apk` 401 without credentials and 200 with them and no
+`content-encoding`, the full 170 MB APK at ~54 MB/s with a sha256 matching
+`apk-update.json`, `admin.raid…` 401, no `cf-ray`, and no listener on
+`192.168.1.104:443` or the public IP.
+
 Upstream TLS is always **verification disabled** (self-signed, `CN=localhost`).
 
 ## 5. Reference implementation (Caddy)
@@ -234,9 +259,10 @@ proxying off **before** deleting the custom domain.
 - **Compression / chunked re-encoding** — breaks the exact `Content-Length` check.
 - **Caching + Basic auth** — would leak the APK to unauthenticated clients.
 - **WebSocket timeouts** — 60 s defaults kill gameplay; use ≥ 1800 s.
-- **Origin exposure** — with §4 A the origin is still reachable at its own IP:443;
-  scope the origin firewall to the proxy (and drop the router forward if you use
-  a tunnel).
+- **Origin exposure** — §4 B is in use: the edge is published on `127.0.0.1` only
+  and nothing answers on the origin's LAN or public IP. Do not republish the
+  edge on a LAN or public interface, and keep the router's 443 forward deleted;
+  the proxy is the only entry point.
 - **Private-CA origin cert** — never present it to clients; terminate at the proxy.
 - **Hostname is baked into APKs** — a rename requires shipping a new APK first.
 
