@@ -221,6 +221,65 @@ class ServerContentIdentityTests(unittest.TestCase):
             self.assertFalse(runtime.same_server(bare, {'release_path': str(bare), 'image': 'sha256:' + '4' * 64}))
 
 
+class PublishedShapeTests(unittest.TestCase):
+    """An unpublished world with the intended admin runtime is the same shape."""
+
+    class Admin:
+        def __init__(self, running, engine, support):
+            self.running, self.engine, self.support = running, engine, support
+
+        def enabled(self, cid=None):
+            return self.engine if cid is None else self.running
+
+        def supported(self, release):
+            return self.support
+
+    def release(self, root, name):
+        base = Path(root) / name
+        base.mkdir(parents=True)
+        (base / 'server.json').write_text(json.dumps({'commit': name, 'image': IMAGE,
+                                                      'base': 'python@sha256:' + '1' * 64,
+                                                      'source_files': {'server/multiplayer_server.py': 'a' * 64}}))
+        return base
+
+    def runtime(self, *, bindings, running_admin=True, engine_admin=True, support=True):
+        runtime = object.__new__(e.Engine)
+        # The engine config still names an admin publication; the ingress carries the
+        # route and the world itself publishes nothing.
+        runtime.c = {'https_port': 19543, 'game_port': 19544,
+                     'admin_publish_address': '127.0.0.1', 'admin_public_port': 19445}
+        runtime.admin = self.Admin(running_admin, engine_admin, support)
+        runtime.inspect = lambda cid: {'HostConfig': {'PortBindings': bindings}}
+        return runtime
+
+    def test_unpublished_world_is_the_same_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            new, old = self.release(directory, 'new'), self.release(directory, 'old')
+            runtime = self.runtime(bindings={})
+            self.assertTrue(runtime.same_server(new, {'release_path': str(old), 'container': 'c' * 64}))
+
+    def test_world_host_binding_forces_a_recreation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            new, old = self.release(directory, 'new'), self.release(directory, 'old')
+            runtime = self.runtime(bindings={'9445/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '19445'}]})
+            self.assertFalse(runtime.same_server(new, {'release_path': str(old), 'container': 'c' * 64}))
+
+    def test_admin_runtime_mismatch_forces_a_recreation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            new, old = self.release(directory, 'new'), self.release(directory, 'old')
+            for running, engine, support in ((False, True, True), (True, False, True), (True, True, False)):
+                with self.subTest(running=running, engine=engine, support=support):
+                    runtime = self.runtime(bindings={}, running_admin=running,
+                                           engine_admin=engine, support=support)
+                    self.assertFalse(runtime.same_server(new, {'release_path': str(old), 'container': 'c' * 64}))
+
+    def test_missing_container_falls_back_to_the_content_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            new, old = self.release(directory, 'new'), self.release(directory, 'old')
+            runtime = object.__new__(e.Engine)
+            self.assertTrue(runtime.same_server(new, {'release_path': str(old)}))
+
+
 class AssetsPublicationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

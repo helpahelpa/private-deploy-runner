@@ -122,23 +122,6 @@ def server_identity(release):
     return hashlib.sha256(json.dumps({'base':info['base'],'source':source},sort_keys=True).encode()).hexdigest()
 
 
-def admin_port_bindings(config):
-    """Docker port bindings for the admin API: nothing unless explicitly published."""
-    published = admin_publish(config)
-    return {} if published is None else {'9445/tcp': [{'HostIp': published[0], 'HostPort': str(published[1])}]}
-
-
-def admin_publish(config):
-    """The reviewed admin publication as (address, port), or None when unpublished."""
-    address = config.get('admin_publish_address')
-    if not address:
-        return None
-    port = config.get('admin_public_port')
-    require(type(port) is int and 1 <= port <= 65535 and isinstance(address, str) and 0 < len(address) <= 64,
-            'Invalid admin publication')
-    return address, port
-
-
 def assets_digest(release):
     """Digest of the assets a release would serve."""
     return hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()
@@ -923,14 +906,20 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             matched = image is not None and image == active.get('image')
         if not matched:
             return False
-        # A changed publication (for example the reviewed admin port) needs a
-        # container recreation even when the server code is byte-identical.
+        # The world is never published on the host: the ingress carries the admin
+        # route, and container validation rejects any world port binding. A leftover
+        # binding therefore means a stale shape. The running container must also
+        # carry the admin runtime the engine would create for this release today.
+        # Either difference needs a recreation even when the server code is
+        # byte-identical.
         try:
             data = self.inspect(active['container'])
-            enabled = self.admin.enabled(active['container'])
-            return (data['HostConfig'].get('PortBindings') or {}) == admin_port_bindings(self.c if enabled else {})
+            published = bool(data['HostConfig'].get('PortBindings') or {})
+            running_admin = self.admin.enabled(active['container'])
+            intended_admin = self.admin.enabled() and self.admin.supported(release)
         except (OSError, ValueError, KeyError, DeploymentError, AttributeError):
             return True
+        return not published and running_admin == intended_admin
 
     def publish_assets(self, release, expected_tracked):
         """Publish a release's assets onto the running world without restarting it."""
