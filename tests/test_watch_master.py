@@ -704,3 +704,13 @@ class DocumentationAdoptionTests(unittest.TestCase):
         self.watcher = watch.Watcher(self.config, self.github, lambda: 1735689600.0)
         self.assertEqual(self.watcher.tick(), "adopted")
         self.assertEqual(self.watcher.tick(), "current")
+
+
+    def test_an_adopted_commit_keeps_its_own_status(self):
+        self.assertEqual(self.watcher.tick(), "adopted")
+        state = watch.read_state(self.path)
+        state['last_deployment_run_id'] = 100
+        watch.save_state(self.path, state)
+        restarted = watch.Watcher(self.config, self.github, lambda: 1735689600.0)
+        self.assertEqual(restarted.tick(), "current")
+        self.assertEqual(self.github.statuses[-1][1]["description"], watch.STATUS_DESCRIPTIONS["docs"])

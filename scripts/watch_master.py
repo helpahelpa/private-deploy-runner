@@ -570,7 +570,10 @@ class Watcher:
             outcome = self.state.get("latest_run_outcome")
             if outcome and outcome["sha"] == latest and outcome["conclusion"] == "failure":
                 return "latest_deployment_failed"
-            if self.state["last_deployment_run_id"] is not None:
+            published = self.state.get("commit_statuses", {}).get(latest, {}).get("body", {})
+            if (self.state["last_deployment_run_id"] is not None
+                    and published.get("description") != STATUS_DESCRIPTIONS["docs"]):
+                # An adopted commit keeps its own outcome; there is no run to point at.
                 self.status(latest, "success", self.state["last_deployment_run_id"])
             return "current"
         # Adoption is decided by the broker and cannot be blocked by an earlier
