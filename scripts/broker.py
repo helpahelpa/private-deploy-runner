@@ -176,13 +176,15 @@ class Operations:
 
     def docs_only(self, sha):
         """True when nothing between the tracked commit and this commit can change a build."""
-        require(isinstance(sha, str) and SHA.fullmatch(sha), 'Invalid source commit')
-        base = self.status()
-        require(isinstance(base, str) and SHA.fullmatch(base), 'Invalid active release')
-        self.check_successor(base, sha)
+        require(isinstance(sha, str) and SHA.fullmatch(sha))
+        # The registry, not a live health probe: publishing proves the health.
+        base = engine.Engine(self.c["engine_config"]).tracked()
+        require(isinstance(base, str) and SHA.fullmatch(base))
         self.fetch_commit(sha)
         if not self.has_commit(base):
             self.fetch_commit(base)
+        # Ancestry and the operator alias rule need both commits in the mirror.
+        self.check_successor(base, sha)
         output = self.git("--git-dir=" + str(self.c["source_cache"]), "diff", "--name-only", base, sha).decode()
         return not component_inputs.material([line for line in output.splitlines() if line])
 
@@ -622,7 +624,7 @@ class Operations:
 
     def publish_docs(self, sha):
         """Adopt a documentation-only commit: nothing is built, published or restarted."""
-        require(self.docs_only(sha), 'Documentation publication requires a documentation-only diff')
+        require(self.docs_only(sha))
         runtime = engine.Engine(self.c["engine_config"])
         active = runtime.active()
         authority = runtime.c.get("desired_commit_file")

@@ -573,6 +573,16 @@ class Watcher:
             if self.state["last_deployment_run_id"] is not None:
                 self.status(latest, "success", self.state["last_deployment_run_id"])
             return "current"
+        # Adoption is decided by the broker and cannot be blocked by an earlier
+        # attempt of the same commit: a transient failure must not stop a
+        # documentation-only commit from being adopted.
+        if self.adopt(latest):
+            self.state["deployed_sha"] = latest
+            self.state["inflight"] = None
+            self.state["failures"].pop(latest, None)
+            self.save()
+            self.status(latest, "docs")
+            return "adopted"
         failure = self.state["failures"].get(latest)
         if failure:
             if failure["count"] >= self.config.max_attempts:
@@ -587,15 +597,6 @@ class Watcher:
             if self.config.desired_commit_file is not None:
                 save_desired(self.config.desired_commit_file, confirmed)
             return "source_changed"
-        if self.adopt(latest):
-            # Nothing to build or deploy: record the commit and publish the outcome
-            # instead of spending a workflow run on it.
-            self.state["deployed_sha"] = latest
-            self.state["inflight"] = None
-            self.state["failures"].pop(latest, None)
-            self.save()
-            self.status(latest, "docs")
-            return "adopted"
         self.state["inflight"] = {"sha": latest, "since": now, "run_id": None}
         self.save()  # Durable intent precedes the API call, including timeouts.
         self.status(latest, "queued")

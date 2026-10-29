@@ -908,3 +908,50 @@ class DocumentationAdoptionTests(unittest.TestCase):
         result=self.request('status',sha=A)
         self.assertEqual(('failed',False),(result['status'],result['replacement_verified']))
         self.assertEqual(job_before,self.broker.path(A,'12345-1').read_bytes())
+
+
+class DocumentationClassificationTests(unittest.TestCase):
+    """The broker decides from the private mirror, never from the caller's claim."""
+
+    class Registry:
+        def tracked(self):
+            return A
+
+    def operations(self, diff):
+        operations = object.__new__(broker.Operations)
+        operations.c = {'source_cache': Path('/private/source.git'),
+                        'engine_config': '/private/engine.json'}
+        operations.fetch_commit = lambda sha: Path('/private/source.git')
+        operations.has_commit = lambda sha: True
+        operations.check_successor = lambda base, sha: None
+        operations.git = lambda *arguments: (diff + '\n').encode()
+        return operations
+
+    def probe(self, diff, sha=B):
+        with patch.object(broker.engine, 'Engine', lambda config, _r=self.Registry(): _r):
+            return self.operations(diff).docs_only(sha)
+
+    def test_documentation_only_diff_is_adoptable(self):
+        self.assertTrue(self.probe('docs/ci-performance.md\ndeploy/cloudflare/README.md'))
+
+    def test_any_material_path_keeps_the_commit_for_the_pipeline(self):
+        self.assertFalse(self.probe('README.md\nserver/multiplayer_server.py'))
+        self.assertFalse(self.probe('AGENTS.md'))
+
+    def test_an_empty_diff_has_nothing_to_build(self):
+        self.assertTrue(self.probe(''))
+
+    def test_an_invalid_commit_is_rejected(self):
+        for sha in ('nope', 'a' * 39, None, True):
+            with self.subTest(sha=sha), self.assertRaises(broker.BrokerError):
+                self.probe('docs/a.md', sha=sha)
+
+    def test_the_commit_is_fetched_before_ancestry_is_checked(self):
+        calls = []
+        operations = self.operations('docs/a.md')
+        operations.fetch_commit = lambda sha: (calls.append(('fetch', sha)),
+                                               Path('/private/source.git'))[1]
+        operations.check_successor = lambda base, sha: calls.append(('successor', base, sha))
+        with patch.object(broker.engine, 'Engine', lambda config, _r=self.Registry(): _r):
+            self.assertTrue(operations.docs_only(B))
+        self.assertEqual([('fetch', B), ('successor', A, B)], calls)

@@ -681,3 +681,15 @@ class DocumentationAdoptionTests(unittest.TestCase):
             watch.Config.read(dict(base, broker_token_file=str(self.token)))
         with self.assertRaises(watch.WatchError):
             watch.Config.read(dict(base, broker_socket="relative.sock", broker_token_file=str(self.token)))
+
+
+    def test_adoption_survives_an_exhausted_retry_history(self):
+        state = watch.read_state(self.path)
+        state['failures'] = {A: {'count': 3, 'at': 1735689600.0}}
+        state['deployed_sha'] = B
+        watch.save_state(self.path, state)
+        self.watcher = watch.Watcher(self.config, self.github, lambda: 1735689600.0)
+        self.assertEqual(self.watcher.tick(), "adopted")
+        self.assertFalse(self.github.dispatches)
+        self.assertEqual(self.watcher.state["deployed_sha"], A)
+        self.assertNotIn(A, self.watcher.state["failures"])
