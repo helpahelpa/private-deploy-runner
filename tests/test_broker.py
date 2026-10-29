@@ -71,6 +71,9 @@ class AttemptOperations(FakeOperations):
     def assets_can_publish(self, release):
         return False
 
+    def docs_only(self, sha):
+        return False
+
     def release_is_active(self, release):
         return False
 
@@ -822,3 +825,86 @@ class BrokerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DocumentationAdoptionOperations(AttemptOperations):
+    """A documentation-only commit is adopted with no build and no container change."""
+
+    def __init__(self):
+        super().__init__()
+        self.docs, self.attest = True, True
+        self.published, self.verified = [], []
+
+    def docs_only(self, sha):
+        return self.docs
+
+    def active_release(self):
+        return Path('/private/active-release')
+
+    def publish_docs(self, sha):
+        self.published.append(sha)
+        self.active = sha
+        return {'id': 'e' * 32, 'phase': 'docs', 'restarted': False, 'to': sha, 'from': B,
+                'rollback': False, 'release_path': '/private/active-release',
+                'previous_release_path': '/private/active-release',
+                'container': 'e' * 64, 'image': 'sha256:' + '1' * 64, 'assets_sha256': 'd' * 64}
+
+    def verify_docs_publication(self, sha, proof):
+        self.verified.append(sha)
+        return self.attest and proof.get('phase') == 'docs' and proof.get('to') == sha
+
+
+class DocumentationAdoptionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);token=self.root/'token';token.write_text(TOKEN);token.chmod(0o600)
+        self.config={'local_root':self.root/'state','token_file':token,'minimum_version':63}
+        self.ops=DocumentationAdoptionOperations();self.broker=broker.Broker(self.config,self.ops)
+
+    def adopt(self,sha=A):
+        return self.broker.handle(dict(op='adopt',sha=sha,token=TOKEN))
+
+    def request(self,operation='submit',sha='',request_id='12345-1'):
+        return self.broker.handle(dict(op=operation,sha=sha,request_id=request_id,token=TOKEN))
+
+    def process(self,request_id='12345-1'):
+        self.broker.process(broker.job_key(A,request_id))
+
+    def test_adopt_records_the_commit_without_a_job_or_build(self):
+        self.assertEqual({'sha': A, 'adopted': True, 'id': 'e' * 32}, self.adopt())
+        self.assertEqual([A], self.ops.published)
+        self.assertEqual([A], self.ops.verified)
+        self.assertEqual([], self.ops.builds)
+        self.assertEqual(0, self.broker.pending.qsize())
+        self.assertFalse(self.broker.path(A, '12345-1').exists())
+
+    def test_a_material_change_is_left_to_the_dispatcher(self):
+        self.ops.docs = False
+        self.assertEqual({'sha': A, 'adopted': False}, self.adopt())
+        self.assertEqual([], self.ops.published)
+
+    def test_a_failed_adoption_never_reports_adopted(self):
+        self.ops.attest = False
+        with self.assertRaises(broker.BrokerError):
+            self.adopt()
+
+    def test_adoption_rejects_an_attempt_identity(self):
+        with self.assertRaises(broker.BrokerError):
+            self.broker.handle(dict(op='adopt',sha=A,request_id='12345-1',token=TOKEN))
+
+    def test_a_workflow_attempt_for_a_documentation_commit_skips_the_build(self):
+        self.request();self.process()
+        self.assertEqual([],self.ops.builds)
+        self.assertEqual([A],self.ops.published)
+        job=json.loads(self.broker.path(A,'12345-1').read_text())
+        self.assertEqual(('docs',False),(job['publication'],job['server_restarted']))
+        result=self.request('status',sha=A)
+        self.assertEqual(('success',True),(result['status'],result['replacement_verified']))
+
+    def test_a_documentation_job_that_is_no_longer_live_never_turns_green(self):
+        self.request();self.process()
+        job_before=self.broker.path(A,'12345-1').read_bytes()
+        self.ops.attest=False
+        result=self.request('status',sha=A)
+        self.assertEqual(('failed',False),(result['status'],result['replacement_verified']))
+        self.assertEqual(job_before,self.broker.path(A,'12345-1').read_bytes())

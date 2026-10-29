@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import tempfile
 import time
@@ -33,7 +34,9 @@ STATUS_DESCRIPTIONS = {
     "failure": "Main deployment failed or was cancelled; see logs",
     "timeout": "Deployment dispatch was not observed; retry may follow",
     "superseded": "Superseded by a newer master push before deployment",
+    "docs": "Documentation-only change; nothing to build or deploy",
 }
+ADOPT_TIMEOUT_SECONDS = 20
 
 
 class WatchError(Exception):
@@ -70,6 +73,8 @@ class Config:
     max_attempts: int = 3
     desired_commit_file: Path | None = None
     attempt_bindings: Path | None = None
+    broker_socket: Path | None = None
+    broker_token_file: Path | None = None
     publish_status: bool = False
     control_private: bool = True
 
@@ -84,6 +89,10 @@ class Config:
                                      if value.get("desired_commit_file") is not None else None),
                 attempt_bindings=(Path(value["attempt_bindings"])
                                   if value.get("attempt_bindings") is not None else None),
+                broker_socket=(Path(value["broker_socket"])
+                               if value.get("broker_socket") is not None else None),
+                broker_token_file=(Path(value["broker_token_file"])
+                                   if value.get("broker_token_file") is not None else None),
                 **{key: value[key] for key in (
                     "control_branch", "poll_seconds", "dispatch_grace_seconds",
                     "retry_seconds", "max_attempts", "publish_status", "control_private") if key in value},
@@ -101,6 +110,9 @@ class Config:
                     config.poll_seconds, config.dispatch_grace_seconds,
                     config.retry_seconds, config.max_attempts))
                 or config.max_attempts > 10
+                or (config.broker_socket is None) != (config.broker_token_file is None)
+                or (config.broker_socket is not None and not (
+                    config.broker_socket.is_absolute() and config.broker_token_file.is_absolute()))
                 or type(config.publish_status) is not bool
                 or type(config.control_private) is not bool
                 or config.source.full_name.lower() == config.control.full_name.lower()):
@@ -428,7 +440,7 @@ class Watcher:
         if not self.config.publish_status:
             return
         suffix = f"runs/{run_id}" if run_id is not None else f"workflows/{WORKFLOW}"
-        body = {"state": "success" if phase == "success" else "failure" if phase in ("failure", "timeout", "superseded") else "pending",
+        body = {"state": "success" if phase in ("success", "docs") else "failure" if phase in ("failure", "timeout", "superseded") else "pending",
                 "context": "deployment/Main", "description": STATUS_DESCRIPTIONS[phase],
                 "target_url": f"https://github.com/{self.config.control.full_name}/actions/{suffix}"}
         statuses = self.state["commit_statuses"]
@@ -477,6 +489,27 @@ class Watcher:
             return self.verified_tick()
         finally:
             self.publish_statuses()
+
+    def adopt(self, sha):
+        """Adopt a documentation-only commit through the broker: no workflow run."""
+        if self.config.broker_socket is None:
+            return False
+        try:
+            token = Path(self.config.broker_token_file).read_text().strip()
+            payload = json.dumps({"token": token, "op": "adopt", "sha": sha}) + "\n"
+            with socket.socket(socket.AF_UNIX) as stream:
+                stream.settimeout(ADOPT_TIMEOUT_SECONDS)
+                stream.connect(str(self.config.broker_socket))
+                stream.sendall(payload.encode())
+                raw = stream.makefile("rb").readline(4096 + 1)
+            result = json.loads(raw)
+        except (OSError, ValueError):
+            # The broker is the only authority; any doubt leaves the normal
+            # dispatch path in charge.
+            return False
+        return (isinstance(result, dict) and result.get("ok") is True
+                and isinstance(result.get("data"), dict)
+                and result["data"].get("adopted") is True and result["data"].get("sha") == sha)
 
     def verified_tick(self):
         latest = self.master()
@@ -554,6 +587,15 @@ class Watcher:
             if self.config.desired_commit_file is not None:
                 save_desired(self.config.desired_commit_file, confirmed)
             return "source_changed"
+        if self.adopt(latest):
+            # Nothing to build or deploy: record the commit and publish the outcome
+            # instead of spending a workflow run on it.
+            self.state["deployed_sha"] = latest
+            self.state["inflight"] = None
+            self.state["failures"].pop(latest, None)
+            self.save()
+            self.status(latest, "docs")
+            return "adopted"
         self.state["inflight"] = {"sha": latest, "since": now, "run_id": None}
         self.save()  # Durable intent precedes the API call, including timeouts.
         self.status(latest, "queued")

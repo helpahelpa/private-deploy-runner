@@ -11,11 +11,27 @@ def server_fixture(name):
             and path.name.endswith('_admin.py') and not path.name.startswith('test_')))
 
 
+def documentation(name):
+    """True when a path can never change a built component.
+
+    Both component identities keep documentation out, with the single exception of
+    AGENTS.md, which the build and QA read as instructions. Deployment decisions use
+    the same rule, so a documentation-only commit needs no build at all.
+    """
+    path = PurePosixPath(name)
+    return path.suffix == '.md' and path.name != 'AGENTS.md'
+
+
+def material(paths):
+    """True when any of the changed paths can change a built component."""
+    return any(not documentation(name) for name in paths)
+
+
 def client_source(tree):
     # The invitation client integration imports this one server test helper.
     # Server production remains shared: those integrations must run when it changes.
     return {name: value for name, value in tree.items()
-            if (PurePosixPath(name).suffix != '.md' or PurePosixPath(name).name == 'AGENTS.md')
+            if not documentation(name)
             and not name.startswith('deploy/cloudflare/')
             and not (name.startswith('server/test_') and name != 'server/test_account_auth.py')}
 
@@ -27,7 +43,7 @@ def fallback_source(tree):
     owners = ('server/', 'launch-build/', 'work/', 'output/', 'deploy/cloudflare/', 'deploy/multiplayer/')
     return {name: value for name, value in tree.items()
             if PurePosixPath(name).name == 'AGENTS.md'
-            or (not name.startswith(owners) and PurePosixPath(name).suffix != '.md')}
+            or (not name.startswith(owners) and not documentation(name))}
 
 
 def identity(tree, component):

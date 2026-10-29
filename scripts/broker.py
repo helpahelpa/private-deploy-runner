@@ -22,6 +22,7 @@ import traceback
 
 import deploy_engine as engine
 import check_transport as transport
+import component_inputs
 import build_logs
 import native_apk
 import git_source
@@ -162,6 +163,29 @@ class Operations:
                 and SHA.fullmatch(value["object"]["sha"]))
         return value["object"]["sha"]
 
+    def active_release(self):
+        """The release the running world was started from."""
+        return Path(engine.Engine(self.c["engine_config"]).active()['release_path'])
+
+    def has_commit(self, sha):
+        try:
+            return self.git("--git-dir=" + str(self.c["source_cache"]), "rev-parse", "--verify",
+                            "--quiet", sha + "^{commit}").decode().strip() == sha
+        except BrokerError:
+            return False
+
+    def docs_only(self, sha):
+        """True when nothing between the tracked commit and this commit can change a build."""
+        require(isinstance(sha, str) and SHA.fullmatch(sha), 'Invalid source commit')
+        base = self.status()
+        require(isinstance(base, str) and SHA.fullmatch(base), 'Invalid active release')
+        self.check_successor(base, sha)
+        self.fetch_commit(sha)
+        if not self.has_commit(base):
+            self.fetch_commit(base)
+        output = self.git("--git-dir=" + str(self.c["source_cache"]), "diff", "--name-only", base, sha).decode()
+        return not component_inputs.material([line for line in output.splitlines() if line])
+
     def preflight(self):
         # Configuration errors must fail before any compiler or test container
         # starts. Read the private file directly without initializing runtime.
@@ -274,7 +298,8 @@ class Operations:
             shutil.copyfile(source, target)
             target.chmod(0o400)
 
-    def source(self, sha, request_id=None):
+    def fetch_commit(self, sha):
+        """Ensure the private mirror holds exactly this commit; returns the mirror path."""
         cache = self.c["source_cache"]
         cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         require(not cache.is_symlink())
@@ -288,6 +313,10 @@ class Operations:
         remote = "git@github.com:" + self.c["source"].full_name + ".git"
         self.git("--git-dir=" + str(cache), "fetch", "--no-tags", "--no-recurse-submodules", remote, sha)
         require(self.git("--git-dir=" + str(cache), "rev-parse", sha + "^{commit}").decode().strip() == sha)
+        return cache
+
+    def source(self, sha, request_id=None):
+        cache = self.fetch_commit(sha)
         destination = self.root / "work" / job_key(sha, request_id)
         if destination.exists():
             require(request_id is None)
@@ -591,6 +620,33 @@ class Operations:
         watch.save_desired(authority, sha)
         return runtime.publish_unchanged(release, runtime.tracked(active))
 
+    def publish_docs(self, sha):
+        """Adopt a documentation-only commit: nothing is built, published or restarted."""
+        require(self.docs_only(sha), 'Documentation publication requires a documentation-only diff')
+        runtime = engine.Engine(self.c["engine_config"])
+        active = runtime.active()
+        authority = runtime.c.get("desired_commit_file")
+        require(authority is not None and Path(authority).is_absolute())
+        watch.save_desired(authority, sha)
+        return runtime.publish_docs(sha, runtime.tracked(active))
+
+    def verify_docs_publication(self, sha, proof):
+        """Prove that an adopted documentation commit left the running world untouched."""
+        require(isinstance(proof, dict) and re.fullmatch(r'[0-9a-f]{32}', proof.get('id', ''))
+                and proof.get('phase') == 'docs' and proof.get('restarted') is False
+                and proof.get('to') == sha and proof.get('rollback') is False
+                and re.fullmatch(r'[0-9a-f]{64}', proof.get('container', ''))
+                and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', proof.get('image', '')))
+        runtime = engine.Engine(self.c['engine_config'])
+        require(json.loads((runtime.root / 'deployments' / (proof['id'] + '.json')).read_text()) == proof)
+        require(runtime.status()['managed_release'] == sha)
+        active = runtime.active()
+        require(active['container'] == proof['container'] and active.get('tracked') == sha
+                and active['release'] == proof['from'] and active['image'] == proof['image']
+                and str(active['release_path']) == proof['release_path'])
+        require(runtime.inspect(proof['container'])['State']['Running'] is True)
+        return True
+
     def verify_publication(self, sha, release, proof):
         require(isinstance(proof, dict) and re.fullmatch(r'[0-9a-f]{32}', proof.get('id', ''))
                 and proof.get('phase') == 'unchanged' and proof.get('restarted') is False
@@ -686,6 +742,15 @@ class Broker:
             if job["status"] == "queued":
                 self.pending.put(path.stem)
 
+    def adopt(self, sha):
+        """Adopt a documentation-only commit: no job, no build, no workflow run."""
+        if not self.operations.docs_only(sha):
+            return {'sha': sha, 'adopted': False}
+        proof = self.operations.publish_docs(sha)
+        require(self.operations.verify_docs_publication(sha, proof) is True)
+        build_logs.emit('Documentation-only change; adopted without a build or deployment.')
+        return {'sha': sha, 'adopted': True, 'id': proof['id']}
+
     def public(self, job):
         result={name: job[name] for name in ("sha", "status", "stage")}
         phase={'source':'building','server':'building_testing','client':'building_testing',
@@ -707,7 +772,7 @@ class Broker:
             expected.add('force_full_qa')
         require(set(request) == expected)
         require(isinstance(request["token"], str) and hmac.compare_digest(request["token"], self.token))
-        require(operation in ("submit", "status", "logs"))
+        require(operation in ("submit", "status", "logs", "adopt"))
         if operation == "logs":
             require(type(request["cursor"]) is int and 0 <= request["cursor"] < (1 << 63))
         request_id=request.get('request_id')
@@ -715,6 +780,10 @@ class Broker:
         if 'request_id' in request:require(isinstance(request_id,str) and REQUEST_ID.fullmatch(request_id))
         require(operation!='submit' or not self.c.get('require_request_id_for_submit',False) or request_id is not None)
         sha = request["sha"]
+        if operation == "adopt":
+            require(request_id is None)
+            with self.mutex:
+                return self.adopt(sha)
         with self.mutex:
             if sha=='' and operation=='submit' and request_id is not None:
                 binding=self.root/'attempts'/(request_id+'.json')
@@ -776,6 +845,8 @@ class Broker:
             return self.operations.verify_publication(sha, release, proof) is True
         if publication == 'assets':
             return self.operations.verify_assets_publication(sha, release, proof) is True
+        if publication == 'docs':
+            return self.operations.verify_docs_publication(sha, proof) is True
         return self.operations.verify_replacement(sha, release, proof) is True
 
     def stage(self, sha, stage):
@@ -807,15 +878,25 @@ class Broker:
             require(self.operations.current() == sha)
             self.operations.preflight()
             job = self.load(sha,request_id)
-            build_args=(sha,job['version'],lambda stage:self.stage(key,stage))
-            build_options={'request_id':request_id} if request_id is not None else {}
-            if job.get('force_full_qa',False):build_options['force_full_qa']=True
-            release = self.operations.build(*build_args,**build_options)
+            docs = request_id is not None and self.operations.docs_only(sha)
+            if docs:
+                # Nothing to compile or publish: adopt the commit onto the running world.
+                release = self.operations.active_release()
+            else:
+                build_args=(sha,job['version'],lambda stage:self.stage(key,stage))
+                build_options={'request_id':request_id} if request_id is not None else {}
+                if job.get('force_full_qa',False):build_options['force_full_qa']=True
+                release = self.operations.build(*build_args,**build_options)
             require(self.operations.current() == sha)
             self.stage(key, "promote")
             restarted=True
             published='handoff'
-            if request_id is not None:
+            if docs:
+                proof=self.operations.publish_docs(sha);restarted=False;published='docs'
+                with self.mutex:
+                    job=self.load(sha,request_id);job.update(release_path=str(Path(release).resolve()),
+                        promotion=proof,server_restarted=restarted,publication=published);self.save(job)
+            elif request_id is not None:
                 # A release that changes neither the server image nor the assets is
                 # adopted in place; changed assets alone are published onto the
                 # running world when it can reload them. Only a new image restarts it.
@@ -835,6 +916,7 @@ class Broker:
             if request_id is not None:
                 if restarted:require(self.operations.verify_replacement(sha,release,proof) is True)
                 elif published=='assets':require(self.operations.verify_assets_publication(sha,release,proof) is True)
+                elif published=='docs':require(self.operations.verify_docs_publication(sha,proof) is True)
                 else:require(self.operations.verify_publication(sha,release,proof) is True)
             with self.mutex:
                 job = self.load(sha,request_id)

@@ -89,9 +89,15 @@ run. A healthy old server restored by rollback never makes the failed run green.
 Same-commit redeployment uses the normal fenced handoff and data-preserving
 snapshot checks, creates a new container, and verifies that its predecessor stopped.
 
-A commit that changes neither the server image nor the release assets - a
-documentation-only change, or anything that leaves both artifacts byte-identical -
-is adopted without touching the running world. The engine records the release
+A commit that touches nothing but documentation is adopted before any build: the
+host watcher asks the broker to adopt it, so no workflow run is spent, and a
+dispatched attempt for such a commit skips the build entirely and records
+`publication: docs`. Documentation means a `.md` path that is not `AGENTS.md`;
+every other path stays material, so a non-documentation change is never skipped.
+
+A commit that changes neither the server image nor the release assets - anything
+that leaves both artifacts byte-identical - is adopted without touching the
+running world. The engine records the release
 receipt with `restarted: false`, moves the tracked commit forward while the
 server release stays the commit whose image is running, verifies the active
 container is still healthy and still the expected image, and the job reports
@@ -179,6 +185,9 @@ example identities with GitHub's numeric repository and owner IDs. Set
 `desired_commit_file` to the same absolute private path required by the engine.
 The watcher atomically publishes verified master there on every poll, including
 during a running build, without rewriting an unchanged SHA. Set
+Set the watcher's optional `broker_socket` and `broker_token_file` to the broker's
+private socket and token to let it adopt documentation-only commits without
+dispatching; leave both unset to keep every push on the workflow path.
 `attempt_bindings` to the broker's private `attempts` directory so manual runs
 and same-run retry attempts update source commit status, including failure of
 a redeployment of an already deployed commit. An older success cannot overwrite

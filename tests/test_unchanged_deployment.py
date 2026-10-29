@@ -10,13 +10,14 @@ from unittest.mock import patch
 import uuid
 
 import broker
+import component_inputs
 import watch_master
 
 spec = importlib.util.spec_from_file_location('engine_unchanged', Path(__file__).resolve().parents[1] / 'scripts/deploy_engine.py')
 e = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(e)
 
-A, B = 'a' * 40, 'b' * 40
+A, B, C40 = 'a' * 40, 'b' * 40, 'c' * 40
 TOKEN = 'fixture-private-token-' + 'x' * 40
 IMAGE = 'sha256:' + '1' * 64
 
@@ -54,6 +55,9 @@ class FakeOperations:
     def verify_assets_publication(self, sha, release, proof):
         self.verifications.append(('assets', proof['restarted']))
         return proof['restarted'] is False
+
+    def docs_only(self, sha):
+        return False
 
     def release_is_active(self, release):
         return self.unchanged
@@ -467,3 +471,79 @@ class EnginePublicationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DocumentationInputRuleTests(unittest.TestCase):
+    """Only documentation may skip a build; AGENTS.md is instructions, not documentation."""
+
+    def test_documentation_paths_cannot_change_a_build(self):
+        self.assertFalse(component_inputs.material([]))
+        self.assertFalse(component_inputs.material(['docs/ci-performance.md',
+                                                   'deploy/cloudflare/README.md',
+                                                   'server/NOTES.md']))
+
+    def test_every_other_path_is_material(self):
+        for path in ('server/multiplayer_server.py', 'AGENTS.md', 'server/native_contracts.json',
+                     'launch-build/qa_stage2_combat_fixture.py', 'deploy/cloudflare/compose.yaml'):
+            with self.subTest(path=path):
+                self.assertTrue(component_inputs.material([path]))
+        self.assertTrue(component_inputs.material(['README.md', 'server/multiplayer_server.py']))
+
+
+class DocumentationPublicationTests(unittest.TestCase):
+    """A documentation-only commit moves the tracked commit and nothing else."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'deployments').mkdir()
+        self.runtime = object.__new__(e.Engine)
+        self.runtime.c = {'health_timeout_seconds': 5}
+        self.runtime.root = self.root
+        self.release = self.root / 'release'
+        self.release.mkdir()
+        (self.release / 'server.json').write_text(json.dumps({'image': IMAGE, 'base': 'python@sha256:' + '1' * 64,
+                                                             'source_files': {'server/x.py': 'a' * 64}}))
+        self.manifest = {'commit': A, 'image': IMAGE}
+        self.active = {'release': A, 'tracked': A, 'image': IMAGE, 'container': 'c' * 64,
+                       'release_path': str(self.release), 'assets_sha256': 'd' * 64}
+
+    def patched(self, inspect_image=IMAGE):
+        @contextlib.contextmanager
+        def lock(*_args, **_kwargs):
+            yield
+        return [patch.object(self.runtime, 'lock', lock),
+                patch.object(self.runtime, 'verify', lambda p: (Path(p), self.manifest)),
+                patch.object(self.runtime, 'active', lambda: self.active),
+                patch.object(self.runtime, 'healthy', lambda *a, **k: {}),
+                patch.object(self.runtime, 'inspect',
+                             lambda cid, timeout=None: {'State': {'Running': True}, 'Image': inspect_image})]
+
+    def publish(self, commit=C40, expected=A, **options):
+        for item in self.patched(**options):
+            item.start()
+            self.addCleanup(item.stop)
+        return self.runtime.publish_docs(commit, expected)
+
+    def test_documentation_commit_moves_only_the_tracked_commit(self):
+        proof = self.publish()
+        self.assertEqual({'phase': 'docs', 'restarted': False, 'to': C40, 'from': A},
+                         {key: proof[key] for key in ('phase', 'restarted', 'to', 'from')})
+        active = json.loads((self.root / 'active.json').read_text())
+        self.assertEqual((A, C40, 'c' * 64, str(self.release)),
+                         (active['release'], active['tracked'], active['container'], active['release_path']))
+        self.assertEqual(proof, json.loads((self.root / 'deployments' / (proof['id'] + '.json')).read_text()))
+
+    def test_stale_documentation_publication_is_refused(self):
+        with self.assertRaisesRegex(e.DeploymentError, 'Stale documentation publication'):
+            self.publish(expected=B)
+
+    def test_a_world_that_is_not_the_expected_image_is_refused(self):
+        with self.assertRaisesRegex(e.DeploymentError, 'Active world is not the expected image'):
+            self.publish(inspect_image='sha256:' + '9' * 64)
+
+    def test_invalid_commit_is_rejected(self):
+        for commit in ('', 'a' * 39, 'g' * 40, None):
+            with self.subTest(commit=commit), self.assertRaisesRegex(e.DeploymentError, 'Invalid documentation commit'):
+                self.publish(commit=commit)

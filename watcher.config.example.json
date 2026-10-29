@@ -14,6 +14,8 @@
   "state_file": "/state/master-watcher.json",
   "desired_commit_file": "/state/desired-master",
   "attempt_bindings": "/state/deployment/attempts",
+  "broker_socket": "/state/deployment/ipc/broker.sock",
+  "broker_token_file": "/state/deployment/token",
   "publish_status": false,
   "poll_seconds": 10,
   "dispatch_grace_seconds": 120,

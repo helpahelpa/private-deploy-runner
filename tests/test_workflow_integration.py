@@ -86,6 +86,9 @@ class GatedOperations:
     def assets_can_publish(self, release):
         return False
 
+    def docs_only(self, sha):
+        return False
+
     def release_is_active(self, release):
         return False
 

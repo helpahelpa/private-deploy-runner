@@ -2,9 +2,11 @@ import importlib.util
 from dataclasses import replace
 import json
 from pathlib import Path
+import socketserver
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -589,3 +591,93 @@ class BoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeBroker:
+    """Minimal private IPC peer for the documentation adoption probe."""
+
+    def __init__(self, directory, response):
+        self.path = Path(directory) / "broker.sock"
+        self.response = response
+        self.requests = []
+        self.closed = False
+        outer = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                outer.requests.append(json.loads(self.rfile.readline()))
+                self.wfile.write((json.dumps(outer.response) + "\n").encode())
+
+        self.server = socketserver.UnixStreamServer(str(self.path), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.server.shutdown()
+        self.server.server_close()
+        self.path.unlink(missing_ok=True)
+
+
+class DocumentationAdoptionTests(unittest.TestCase):
+    """A documentation-only commit is adopted without spending a workflow run."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.path = self.root / "state.json"
+        self.token = self.root / "token"
+        self.token.write_text("t" * 40)
+        self.token.chmod(0o600)
+        self.broker = FakeBroker(self.root, {"ok": True, "data": {"sha": A, "adopted": True}})
+        self.addCleanup(self.broker.close)
+        self.github = FakeGitHub()
+        self.config = watch.Config.read({
+            "source": {"full_name": "example/source", "repository_id": 10, "owner_id": 1},
+            "control": {"full_name": "example/control", "repository_id": 11, "owner_id": 1},
+            "state_file": str(self.path),
+            "broker_socket": str(self.broker.path),
+            "broker_token_file": str(self.token),
+            "publish_status": True,
+        })
+        self.watcher = watch.Watcher(self.config, self.github, lambda: 1735689600.0)
+
+    def test_documentation_commit_is_adopted_without_dispatching(self):
+        self.assertEqual(self.watcher.tick(), "adopted")
+        self.assertFalse(self.github.dispatches)
+        self.assertEqual(self.watcher.state["deployed_sha"], A)
+        self.assertEqual({"token": "t" * 40, "op": "adopt", "sha": A}, self.broker.requests[0])
+        self.assertEqual(self.github.statuses[-1][1]["state"], "success")
+        self.assertEqual(self.github.statuses[-1][1]["description"], watch.STATUS_DESCRIPTIONS["docs"])
+        self.assertEqual(watch.read_state(self.path)["deployed_sha"], A)
+        self.assertEqual(watch.Watcher(self.config, self.github, lambda: 1735689600.0).tick(), "current")
+
+    def test_material_change_still_dispatches_the_workflow(self):
+        self.broker.response = {"ok": True, "data": {"sha": A, "adopted": False}}
+        self.assertEqual(self.watcher.tick(), "dispatched")
+        self.assertEqual(self.github.dispatches, [{"ref": "master", "inputs": {"source_sha": A}}])
+        self.assertIsNone(self.watcher.state["deployed_sha"])
+
+    def test_an_unavailable_broker_leaves_the_dispatch_path_in_charge(self):
+        self.broker.close()
+        self.assertEqual(self.watcher.tick(), "dispatched")
+        self.assertEqual(self.github.dispatches, [{"ref": "master", "inputs": {"source_sha": A}}])
+
+    def test_a_rejected_request_is_not_an_adoption(self):
+        self.broker.response = {"ok": False, "error": "request_rejected"}
+        self.assertEqual(self.watcher.tick(), "dispatched")
+        self.assertEqual(self.github.dispatches, [{"ref": "master", "inputs": {"source_sha": A}}])
+
+    def test_broker_paths_must_be_configured_together(self):
+        base = {"source": {"full_name": "example/source", "repository_id": 10, "owner_id": 1},
+                "control": {"full_name": "example/control", "repository_id": 11, "owner_id": 1},
+                "state_file": str(self.path)}
+        with self.assertRaises(watch.WatchError):
+            watch.Config.read(dict(base, broker_socket=str(self.broker.path)))
+        with self.assertRaises(watch.WatchError):
+            watch.Config.read(dict(base, broker_token_file=str(self.token)))
+        with self.assertRaises(watch.WatchError):
+            watch.Config.read(dict(base, broker_socket="relative.sock", broker_token_file=str(self.token)))

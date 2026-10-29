@@ -894,6 +894,32 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             build_logs.emit('Deployment: server image and assets unchanged; the active world was left running.')
             return event
 
+    def publish_docs(self, commit, expected_tracked):
+        """Adopt a documentation-only commit: nothing is built, published or restarted."""
+        require(isinstance(commit, str) and SHA.fullmatch(commit), 'Invalid documentation commit')
+        with self.lock(wait_seconds=20):
+            active = self.active()
+            require(SHA.fullmatch(expected_tracked or '') and self.tracked(active) == expected_tracked,
+                    'Stale documentation publication')
+            path, old = self.verify(active['release_path'])
+            self.healthy(active['container'], path, old, time.monotonic() + self.c.get('health_timeout_seconds', 15))
+            current = self.inspect(active['container'])
+            require(current['State']['Running'] and current['Image'] == active['image'],
+                    'Active world is not the expected image')
+            deployment = uuid.uuid4().hex
+            event = {'id': deployment, 'from': old['commit'], 'to': commit, 'phase': 'docs',
+                     'restarted': False, 'rollback': False, 'container': active['container'],
+                     'image': active['image'], 'assets_sha256': active['assets_sha256'],
+                     'previous_release_path': str(path), 'release_path': str(path)}
+            write_json(self.root/'deployments'/(deployment+'.json'), event)
+            updated = dict(active, tracked=commit)
+            write_json(self.root/'active.json', updated)
+            if self.c.get('runtime_registry'):
+                write_json(self.c['runtime_registry'], updated)
+            build_logs.emit('Deployment: documentation-only change; no build, no asset publication, '
+                            'the active world was left running.')
+            return event
+
     def same_server(self, release, active):
         """True when the release runs the same server content and published shape."""
         try:
