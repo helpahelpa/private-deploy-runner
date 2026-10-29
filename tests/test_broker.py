@@ -84,6 +84,65 @@ class AttemptOperations(FakeOperations):
         return proof['container']!=proof['from_container'] and proof['release_path']==str(release)
 
 
+class AdoptedOperations(AttemptOperations):
+    """A release whose server image and assets are already active is adopted."""
+
+    def __init__(self):
+        super().__init__()
+        self.publications, self.attestations, self.attest = [], [], True
+
+    def release_is_active(self, release):
+        return True
+
+    def publish_unchanged(self, sha, release):
+        self.publications.append(sha)
+        self.active = sha
+        return {'id': 'c' * 32, 'phase': 'unchanged', 'restarted': False, 'to': sha,
+                'from': B, 'container': 'e' * 64, 'image': 'sha256:' + '1' * 64,
+                'assets_sha256': 'd' * 64, 'release_path': str(release),
+                'previous_release_path': '/private/older'}
+
+    def verify_publication(self, sha, release, proof):
+        self.attestations.append((sha, proof['phase']))
+        return self.attest
+
+    def verify_replacement(self, sha, release, proof):
+        raise AssertionError('An adopted release has no replacement container to verify')
+
+
+class AdoptedPublicationAttestationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);token=self.root/'token';token.write_text(TOKEN);token.chmod(0o600)
+        self.config={'local_root':self.root/'state','token_file':token,'minimum_version':63}
+        self.ops=AdoptedOperations();self.broker=broker.Broker(self.config,self.ops)
+
+    def request(self,operation='submit',sha='',request_id='12345-1',**extra):
+        return self.broker.handle(dict(op=operation,sha=sha,request_id=request_id,token=TOKEN,**extra))
+
+    def process(self,request_id='12345-1'):
+        self.broker.process(broker.job_key(A,request_id))
+
+    def test_adopted_release_attests_as_unchanged(self):
+        self.request();self.process()
+        result=self.request('status',sha=A,request_id='12345-1')
+        self.assertEqual((A,'success','complete'),(result['sha'],result['status'],result['phase']))
+        self.assertIs(result['replacement_verified'],True)
+        self.assertEqual([A],self.ops.publications)
+        self.assertTrue(self.ops.attestations)
+        self.assertEqual({(A,'unchanged')},set(self.ops.attestations))
+        self.assertEqual([],self.ops.promotions)
+
+    def test_adopted_release_that_is_no_longer_live_never_turns_green(self):
+        self.request();self.process()
+        job_before=self.broker.path(A,'12345-1').read_bytes()
+        self.ops.attest=False
+        result=self.request('status',sha=A,request_id='12345-1')
+        self.assertEqual('failed',result['status'])
+        self.assertIs(result['replacement_verified'],False)
+        self.assertEqual(job_before,self.broker.path(A,'12345-1').read_bytes())
+
+
 class AttemptBrokerTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)

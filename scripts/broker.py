@@ -756,7 +756,7 @@ class Broker:
             result = self.public(job)
             if request_id is not None and operation!='logs' and job['status']=='success':
                 try:
-                    verified=self.operations.verify_replacement(sha,Path(job['release_path']),job['promotion']) is True
+                    verified=self.attested(sha,job)
                 except Exception:
                     verified=False
                 if not verified:
@@ -767,6 +767,16 @@ class Broker:
                 import build_logs
                 result.update(build_logs.read_page(self.root / "public-logs" / key / "journal.log", request["cursor"]))
             return result
+
+    def attested(self, sha, job):
+        """True when the job's recorded publication is still the live state."""
+        release, proof = Path(job['release_path']), job.get('promotion')
+        publication = job.get('publication', 'handoff')
+        if publication == 'unchanged':
+            return self.operations.verify_publication(sha, release, proof) is True
+        if publication == 'assets':
+            return self.operations.verify_assets_publication(sha, release, proof) is True
+        return self.operations.verify_replacement(sha, release, proof) is True
 
     def stage(self, sha, stage):
         with self.mutex:
