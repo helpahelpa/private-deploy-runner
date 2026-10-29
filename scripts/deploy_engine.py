@@ -122,6 +122,17 @@ def server_identity(release):
     return hashlib.sha256(json.dumps({'base':info['base'],'source':source},sort_keys=True).encode()).hexdigest()
 
 
+def admin_port_bindings(config, enabled):
+    """Docker port bindings for the admin API: nothing unless explicitly published."""
+    require(type(enabled) is bool, 'Invalid admin runtime selection')
+    if not enabled or not config.get('admin_publish_address'):
+        return {}
+    address, port = config.get('admin_publish_address'), config.get('admin_public_port')
+    require(type(port) is int and 1 <= port <= 65535 and isinstance(address, str) and 0 < len(address) <= 64,
+            'Invalid admin publication')
+    return {'9445/tcp': [{'HostIp': address, 'HostPort': str(port)}]}
+
+
 def assets_digest(release):
     """Digest of the assets a release would serve."""
     return hashlib.sha256(json.dumps(tree(Path(release)/'assets'),sort_keys=True).encode()).hexdigest()
@@ -652,7 +663,8 @@ class Engine:
         actual=frozenset((m['Type'],m.get('Name') if m['Type']=='volume' else m['Source'],m['Destination'],not m['RW']) for m in data['Mounts'] if m['Type']!='tmpfs')
         require(actual in expected,'Unexpected runtime mount binding')
         ports=host.get('PortBindings') or {}
-        require(not ports,'World ports must be exposed only by trusted ingress')
+        require(ports==admin_port_bindings(self.c,enabled),
+                'World ports must be exposed only by the reviewed admin publication')
         networks=data.get('NetworkSettings',{}).get('Networks',{})
         require(set(networks)=={self.network},'Unexpected world network')
         network=json.loads(self.docker('network','inspect',self.network,timeout=budget()))[0]
@@ -789,6 +801,9 @@ class Engine:
                  '--cert=/certs/server.crt','--key=/certs/server.key','--assets=/assets','--update-config=/assets/update_config.json',
                  '--asset-origin='+c['asset_origin'],'--deployment-control=/control/socket','--deployment-secret=/control/secret',
                  '--deployment-release='+manifest['commit']]
+        for binding in admin_port_bindings(self.c, enabled).values():
+            for target in binding:
+                args += ['--publish','%s:%s:9445' % (target['HostIp'], target['HostPort'])]
         args+=self.admin.flags(enabled)
         if handoff:args+=['--deployment-id='+handoff]
         timeout=max(.1,deadline-time.monotonic()) if deadline else 30

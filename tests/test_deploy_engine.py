@@ -334,6 +334,25 @@ class SameCommitPromotionTests(unittest.TestCase):
         self.assertEqual(2,len(receipts));self.assertTrue(all(value['phase']!='healthy' for value in receipts))
 
 
+class AdminPublicationTests(unittest.TestCase):
+    def test_admin_port_is_unpublished_unless_explicitly_configured(self):
+        base={'admin_public_port':9445}
+        self.assertEqual({}, e.admin_port_bindings(base, False))
+        self.assertEqual({}, e.admin_port_bindings(dict(base, admin_publish_address=''), True))
+        self.assertEqual({}, e.admin_port_bindings(base, True))
+
+    def test_admin_port_binding_is_exact(self):
+        bindings=e.admin_port_bindings({'admin_publish_address':'192.0.2.10','admin_public_port':9445}, True)
+        self.assertEqual({'9445/tcp':[{'HostIp':'192.0.2.10','HostPort':'9445'}]}, bindings)
+
+    def test_invalid_admin_publication_is_rejected(self):
+        for port in (0, 65536, '9445', None, True):
+            with self.subTest(port=port), self.assertRaisesRegex(e.DeploymentError, 'Invalid admin publication'):
+                e.admin_port_bindings({'admin_publish_address':'192.0.2.10','admin_public_port':port}, True)
+        with self.assertRaisesRegex(e.DeploymentError, 'Invalid admin publication'):
+            e.admin_port_bindings({'admin_publish_address':'x'*65,'admin_public_port':9445}, True)
+
+
 class DesktopRecoveryTests(unittest.TestCase):
     def setUp(self):
         BoundaryTests.setUp(self)
