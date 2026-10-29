@@ -663,7 +663,8 @@ class Engine:
         actual=frozenset((m['Type'],m.get('Name') if m['Type']=='volume' else m['Source'],m['Destination'],not m['RW']) for m in data['Mounts'] if m['Type']!='tmpfs')
         require(actual in expected,'Unexpected runtime mount binding')
         ports=host.get('PortBindings') or {}
-        require(ports==admin_port_bindings(self.c,enabled),
+        expected_ports=admin_port_bindings(self.c,enabled)
+        require(ports==expected_ports or (ports=={} and self.c.get('admin_publish_allow_missing') is True),
                 'World ports must be exposed only by the reviewed admin publication')
         networks=data.get('NetworkSettings',{}).get('Networks',{})
         require(set(networks)=={self.network},'Unexpected world network')
@@ -906,11 +907,21 @@ with sqlite3.connect('file:/data/auth.sqlite3?mode=ro',uri=True) as now, sqlite3
             return event
 
     def same_server(self, release, active):
-        """True when the release runs the same server content as the active world."""
+        """True when the release runs the same server content and runtime shape."""
         try:
-            return server_identity(release) == server_identity(active['release_path'])
+            if server_identity(release) != server_identity(active['release_path']):
+                return False
         except (OSError, ValueError, KeyError, DeploymentError):
             pass
+        else:
+            # A changed publication (for example the reviewed admin port) needs a
+            # container recreation even when the server code is byte-identical.
+            try:
+                data=self.inspect(active['container'])
+                enabled=self.admin.enabled(active['container'])
+                return (data['HostConfig'].get('PortBindings') or {})==admin_port_bindings(self.c,enabled)
+            except (OSError, ValueError, KeyError, DeploymentError, AttributeError):
+                return True
         try:
             image = json.loads((Path(release)/'manifest.json').read_text()).get('image')
         except (OSError, ValueError):
